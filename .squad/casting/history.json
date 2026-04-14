@@ -1,0 +1,23 @@
+{
+  "assignment_cast_snapshots": {
+    "repl-cast-2026-04-14T17:00:16.940Z": {
+      "created_at": "2026-04-14T17:00:16.940Z",
+      "agents": [
+        "keyser",
+        "fenster",
+        "redfoot",
+        "mcmanus",
+        "verbal",
+        "scribe",
+        "ralph"
+      ],
+      "universe": "The Usual Suspects"
+    }
+  },
+  "universe_usage_history": [
+    {
+      "universe": "The Usual Suspects",
+      "used_at": "2026-04-14T17:00:16.940Z"
+    }
+  ]
+}
