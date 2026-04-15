@@ -2,7 +2,7 @@
 
 A fast Windows screenshot CLI for AI agents. Captures screens and windows via Win32 GDI and outputs JSON to stdout.
 
-**3.3 MB binary** · **~125ms single monitor** · **Zero dependencies**
+**3.5 MB binary** · **~125ms single monitor** · **Zero dependencies**
 
 ## Install
 
@@ -23,16 +23,41 @@ Or use the build script which also publishes to your tools folder:
 ```
 snapper [options]
 
-Options:
-  -m, --monitor <N>     Monitor number (1-based). Omit to capture all.
-  -w, --window <title>  Capture a window by title (substring match).
-      --pid <N>         Capture a window by process ID.
-      --list-windows    List all visible windows as JSON.
-  -f, --format <fmt>    Output format: png (default) or jpg.
-  -q, --quality <N>     JPEG quality 1-100 (default 85).
-  -o, --output-file     Write image to temp file instead of base64.
-      --stitch          Combine all monitors into one image.
+Capture Target (pick one, or omit for all monitors):
+  -w, --window <title>  Capture a window whose title contains <title> (case-insensitive).
+      --pid <N>         Capture the main window of process <N>.
+  -m, --monitor <N>     Capture monitor N (1-based).
+      --stitch          Capture all monitors combined into one image.
+      --list-windows    List all visible windows as JSON (no capture).
+  (no target)           Capture every monitor as a separate image.
+
+Output Options:
+  -f, --format <fmt>    png (default, lossless) or jpg (smaller, recommended for AI).
+  -q, --quality <1-100> JPEG quality (default 85). Ignored for png.
+  -o, --output-file     Write image to temp file; JSON returns file path.
+  (default)             Base64-encode image inline in JSON.
+
+General:
   -h, --help            Show help.
+```
+
+### Examples
+
+```powershell
+# See what apps are running
+snapper --list-windows
+
+# Capture a specific app window as JPEG
+snapper -w "Visual Studio Code" -f jpg
+
+# Capture a window by its process ID
+snapper --pid 1234 -f jpg -q 75
+
+# Capture primary monitor, save to temp file
+snapper -m 1 -o
+
+# Capture all monitors stitched into one image
+snapper --stitch -f jpg -q 80
 ```
 
 ## Output Format
