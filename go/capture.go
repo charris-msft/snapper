@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"image"
+	"image/jpeg"
 	"image/png"
 	"syscall"
 	"unsafe"
@@ -114,21 +115,28 @@ func captureMonitorRaw(mon MonitorInfo) (*image.NRGBA, error) {
 	return img, nil
 }
 
-// captureMonitor captures a monitor and returns PNG-encoded bytes.
-func captureMonitor(mon MonitorInfo) ([]byte, error) {
+// captureMonitor captures a monitor and returns encoded image bytes.
+func captureMonitor(mon MonitorInfo, format string, quality int) ([]byte, error) {
 	img, err := captureMonitorRaw(mon)
 	if err != nil {
 		return nil, err
 	}
-	return encodePNG(img)
+	return encodeImage(img, format, quality)
 }
 
-// encodePNG encodes an image to PNG with fast compression.
-func encodePNG(img image.Image) ([]byte, error) {
+// encodeImage encodes an image to the given format. For JPEG, quality (1-100) controls compression.
+func encodeImage(img image.Image, format string, quality int) ([]byte, error) {
 	var buf bytes.Buffer
-	encoder := &png.Encoder{CompressionLevel: png.BestSpeed}
-	if err := encoder.Encode(&buf, img); err != nil {
-		return nil, fmt.Errorf("PNG encode failed: %v", err)
+	switch format {
+	case "jpg":
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
+			return nil, fmt.Errorf("JPEG encode failed: %v", err)
+		}
+	default:
+		encoder := &png.Encoder{CompressionLevel: png.BestSpeed}
+		if err := encoder.Encode(&buf, img); err != nil {
+			return nil, fmt.Errorf("PNG encode failed: %v", err)
+		}
 	}
 	return buf.Bytes(), nil
 }

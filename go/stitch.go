@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"image"
 	"image/draw"
 )
@@ -16,8 +15,8 @@ type stitchBounds struct {
 	Height int
 }
 
-// stitchImagesRaw composites raw NRGBA captures into a single PNG (one encode, no decodes).
-func stitchImagesRaw(captures []rawCapture) ([]byte, stitchBounds, error) {
+// stitchImagesRaw composites raw NRGBA captures into a single image (no encoding).
+func stitchImagesRaw(captures []rawCapture) (*image.NRGBA, stitchBounds, error) {
 	minX, minY := int(captures[0].Mon.Bounds.Left), int(captures[0].Mon.Bounds.Top)
 	maxX, maxY := int(captures[0].Mon.Bounds.Right), int(captures[0].Mon.Bounds.Bottom)
 	for _, c := range captures[1:] {
@@ -46,9 +45,5 @@ func stitchImagesRaw(captures []rawCapture) ([]byte, stitchBounds, error) {
 		draw.Draw(canvas, dst, c.Image, image.Point{}, draw.Src)
 	}
 
-	pngData, err := encodePNG(canvas)
-	if err != nil {
-		return nil, stitchBounds{}, fmt.Errorf("encode stitched PNG: %v", err)
-	}
-	return pngData, stitchBounds{Width: totalW, Height: totalH}, nil
+	return canvas, stitchBounds{Width: totalW, Height: totalH}, nil
 }
