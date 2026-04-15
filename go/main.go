@@ -135,19 +135,50 @@ func main() {
 }
 
 func printHelp() {
-	fmt.Print(`Usage: snapper [options]
+	const (
+		reset  = "\033[0m"
+		bold   = "\033[1m"
+		dim    = "\033[2m"
+		green  = "\033[32m"
+		bgreen = "\033[92m"
+		cyan   = "\033[36m"
+		bcyan  = "\033[96m"
+		yellow = "\033[33m"
+		white  = "\033[97m"
+	)
 
-Capture screenshots on Windows.
+	fmt.Fprint(os.Stderr, "\n")
+	fmt.Fprint(os.Stderr, bgreen+"           __"+reset+"\n")
+	fmt.Fprint(os.Stderr, bgreen+"     .-'``  ``'-. "+reset+"\n")
+	fmt.Fprint(os.Stderr, bgreen+"    /  "+yellow+"^ "+green+"    "+yellow+"^"+bgreen+"  \\"+reset+"      "+bold+white+"╔══════════════════════════════╗"+reset+"\n")
+	fmt.Fprint(os.Stderr, bgreen+"   |  "+yellow+"(o)"+green+"  "+yellow+"(o)"+bgreen+"  |"+reset+"      "+bold+white+"║"+reset+"  "+bold+bcyan+"⚡ S N A P P E R"+reset+"              "+bold+white+"║"+reset+"\n")
+	fmt.Fprint(os.Stderr, bgreen+"   |"+green+"    <"+yellow+"__"+green+">    "+bgreen+"|"+reset+"      "+bold+white+"║"+reset+"  "+dim+"Fast screenshot capture"+reset+"       "+bold+white+"║"+reset+"\n")
+	fmt.Fprint(os.Stderr, bgreen+"    \\  "+green+"'-..-'"+bgreen+"  /"+reset+"      "+bold+white+"╚══════════════════════════════╝"+reset+"\n")
+	fmt.Fprint(os.Stderr, green+"  ___"+bgreen+"'-......-'"+green+"___"+reset+"\n")
+	fmt.Fprint(os.Stderr, green+" /"+bgreen+"  "+green+"/============\\"+bgreen+"  "+green+"\\"+reset+"\n")
+	fmt.Fprint(os.Stderr, green+"|"+bgreen+"  "+green+"|"+bcyan+"~~~~~~~~~~~~"+green+"|"+bgreen+"  "+green+"|"+reset+"\n")
+	fmt.Fprint(os.Stderr, green+"|"+bgreen+"  "+green+"|"+bcyan+"~~~~~~~~~~~~"+green+"|"+bgreen+"  "+green+"|"+reset+"\n")
+	fmt.Fprint(os.Stderr, green+" \\"+bgreen+"  "+green+"\\============/"+bgreen+"  "+green+"/"+reset+"\n")
+	fmt.Fprint(os.Stderr, green+"  '-..__    __..-'"+reset+"\n")
+	fmt.Fprint(os.Stderr, green+"       |"+bgreen+"|  |"+green+"|"+reset+"\n")
+	fmt.Fprint(os.Stderr, green+"       |"+bgreen+"|  |"+green+"|"+reset+"\n")
+	fmt.Fprint(os.Stderr, dim+green+"       ^^  ^^"+reset+"\n")
+	fmt.Fprint(os.Stderr, "\n")
 
-Options:
-  -m, --monitor <N>   Monitor number (1-based). Omit to capture all monitors.
-  -o, --output-file   Write PNG to temp file(s) instead of base64 to stdout.
-      --stitch        Combine all monitors into one image (all-monitor mode only).
-  -h, --help          Show this help text and exit.
+	fmt.Fprint(os.Stderr, bold+yellow+"USAGE"+reset+"\n")
+	fmt.Fprint(os.Stderr, "  "+white+"snapper"+reset+" "+dim+"[options]"+reset+"\n\n")
 
-Exit codes:
-  0  Success
-  1  Argument error
-  2  Capture error
-`)
+	fmt.Fprint(os.Stderr, bold+yellow+"DESCRIPTION"+reset+"\n")
+	fmt.Fprint(os.Stderr, "  Capture screenshots on Windows. Output is JSON to stdout.\n\n")
+
+	fmt.Fprint(os.Stderr, bold+yellow+"OPTIONS"+reset+"\n")
+	fmt.Fprint(os.Stderr, "  "+bcyan+"-m"+reset+", "+bcyan+"--monitor"+reset+" "+dim+"<N>"+reset+"   Monitor number (1-based). Omit for all monitors.\n")
+	fmt.Fprint(os.Stderr, "  "+bcyan+"-o"+reset+", "+bcyan+"--output-file"+reset+"   Write PNG to temp file(s) instead of base64.\n")
+	fmt.Fprint(os.Stderr, "      "+bcyan+"--stitch"+reset+"        Combine all monitors into one image (all-monitor mode).\n")
+	fmt.Fprint(os.Stderr, "  "+bcyan+"-h"+reset+", "+bcyan+"--help"+reset+"          Show this help text and exit.\n\n")
+
+	fmt.Fprint(os.Stderr, bold+yellow+"EXIT CODES"+reset+"\n")
+	fmt.Fprint(os.Stderr, "  "+bgreen+"0"+reset+"  Success\n")
+	fmt.Fprint(os.Stderr, "  "+yellow+"1"+reset+"  Argument error\n")
+	fmt.Fprint(os.Stderr, "  "+yellow+"2"+reset+"  Capture error\n\n")
 }
