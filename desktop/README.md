@@ -78,6 +78,9 @@ Stop while paused, Stop during a stalled transition, generated-camera preview
 release and adjustable camera placement. These tests use no real private inputs.
 Use the optimized packaged candidate for media acceptance; debug codec-helper
 startup and hash checking are not a performance baseline.
+Run diagnostics through `scripts\Verify.ps1` (`-Suite Profile`, `Encoders` or
+`Native` as appropriate). It waits for the GUI-subsystem executable and retains
+its output; a bare PowerShell invocation is not a completion check.
 `--profile-test <directory> 600` checks an optimized 1080p generated recording
 with beginning/middle/end A/V markers over ten minutes. Its modest bounded CPU
 peer and injected video gaps do not establish arbitrary-load immunity.

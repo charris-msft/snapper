@@ -306,26 +306,7 @@ impl Devices {
                         } else {
                             let due = state.wall_sample()?;
                             while next_frame + 480 <= due {
-                                let mut pcm = Vec::with_capacity(1920);
-                                let frequency = if system { 440.0 } else { 880.0 };
-                                for frame in next_frame..next_frame + 480 {
-                                    let value = ((frame as f64 / 48000.0
-                                        * frequency
-                                        * std::f64::consts::TAU)
-                                        .sin()
-                                        * 8000.0
-                                        + if frame % 48000 < 4800 {
-                                            (frame as f64 / 48000.0
-                                                * if system { 1200.0 } else { 2400.0 }
-                                                * std::f64::consts::TAU)
-                                                .sin()
-                                                * 6000.0
-                                        } else {
-                                            0.0
-                                        }) as i16;
-                                    pcm.extend(value.to_le_bytes());
-                                    pcm.extend(value.to_le_bytes());
-                                }
+                                let pcm = generated_pcm(next_frame, 480, system);
                                 send_audio(
                                     &state,
                                     &tx,
@@ -823,6 +804,8 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
     let (width, height) = request.canvas();
     let mut output = vec![0; width as usize * height as usize * 4];
     let mut next_tick = 0;
+    let mut last_encoded_ms = None;
+    let mut slow_write_fired = false;
     let mut previous_stamp = None;
     let journal = Arc::new(Mutex::new(
         journal.take().context("Recording journal missing")?,
@@ -927,7 +910,20 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
                     &mut output,
                     request.pip,
                 );
-                write_media(shared, || encoder.video(tick * 1000 / 30, &output))?;
+                let stamp = tick * 1000 / 30;
+                let delay = request.test_fault == Some(TestFault::SlowVideoWrite)
+                    && !slow_write_fired
+                    && video_ms >= 800;
+                write_media(shared, || {
+                    encoder.video(stamp, &output)?;
+                    if delay {
+                        super::mark_fault(request, TestFault::SlowVideoWrite)?;
+                        thread::sleep(Duration::from_millis(400));
+                    }
+                    Ok(())
+                })?;
+                slow_write_fired |= delay;
+                last_encoded_ms = Some(stamp);
                 shared.update(|p| {
                     p.frames += 1;
                     p.repeated += u64::from(repeated);
@@ -988,6 +984,21 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
             p.detail = "Devices released; finalizing media.".into();
         });
     }
+    if result.is_ok() && shared.error().is_none() {
+        if let Some(stamp) = last_encoded_ms.and_then(|last| held_tail_timestamp(last, shared.ms()))
+        {
+            // Seal the presentation of the last admitted pixels, never sample paused sources.
+            if let Err(error) = write_media(shared, || encoder.video(stamp, &output)) {
+                shared.fail(format!("Sealing the held final frame: {error:#}"));
+            } else {
+                shared.update(|p| {
+                    p.frames += 1;
+                    p.repeated += 1;
+                    p.last_write_ms = stamp;
+                });
+            }
+        }
+    }
     if request.test_fault == Some(TestFault::FinalDrainStall) {
         super::mark_fault(request, TestFault::FinalDrainStall)?;
         thread::sleep(Duration::from_secs(60));
@@ -1031,6 +1042,10 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
         return Err(failure).context("Recording interrupted. Use Recover in the library to export the verified completed segments.");
     }
     encoder::final_export(&mut journal)
+}
+
+fn held_tail_timestamp(last: u64, end: u64) -> Option<u64> {
+    (end > last.saturating_add(34)).then(|| end.saturating_sub(33))
 }
 
 pub fn composite_frame(
@@ -1088,6 +1103,28 @@ pub fn composite_frame_with_layout(
     }
 }
 
+pub(super) fn pulse_frequency(system: bool, second: u64) -> f64 {
+    (if system { 1200.0 } else { 4800.0 }) + (second % 16) as f64 * 200.0
+}
+
+pub(super) fn generated_pcm(start: u64, frames: u32, system: bool) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(frames as usize * 4);
+    for frame in start..start + u64::from(frames) {
+        let time = frame as f64 / 48000.0;
+        let tone =
+            (time * if system { 440.0 } else { 880.0 } * std::f64::consts::TAU).sin() * 8000.0;
+        let marker = if frame % 48000 < 4800 {
+            (time * pulse_frequency(system, frame / 48000) * std::f64::consts::TAU).sin() * 6000.0
+        } else {
+            0.0
+        };
+        let value = (tone + marker) as i16;
+        pcm.extend(value.to_le_bytes());
+        pcm.extend(value.to_le_bytes());
+    }
+    pcm
+}
+
 pub fn synthetic_frame(
     width: u32,
     height: u32,
@@ -1130,6 +1167,24 @@ pub fn synthetic_frame(
             }
         }
     }
+    if width >= 80 && height >= 16 {
+        let second = (ms / 1000) as u16;
+        for y in height - 16..height - 8 {
+            for x in 0..76u32 {
+                let white = if x < 64 {
+                    second & (1 << (x / 4)) != 0
+                } else {
+                    x < 68
+                };
+                let offset = (y as usize * width as usize + x as usize) * 4;
+                pixels[offset..offset + 4].copy_from_slice(if white {
+                    &[255, 255, 255, 255]
+                } else {
+                    &[0, 0, 0, 255]
+                });
+            }
+        }
+    }
     Ok(Frame {
         width,
         height,
@@ -1141,6 +1196,12 @@ pub fn synthetic_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn held_frame_sealing_closes_a_slow_write_gap_without_extra_normal_frames() {
+        assert_eq!(held_tail_timestamp(800, 1200), Some(1167));
+        assert_eq!(held_tail_timestamp(19_966, 20_000), None);
+        assert_eq!(held_tail_timestamp(1000, 1010), None);
+    }
     #[test]
     fn pause_acknowledgement_waits_for_inflight_write_and_stop_can_preempt_it() {
         use std::sync::Barrier;

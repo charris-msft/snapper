@@ -2,6 +2,7 @@ use super::{Area, Monitor};
 use crate::capture::{FlowToken, PixelRect, Selection};
 use anyhow::{ensure, Context, Result};
 use std::{
+    cell::{Cell, RefCell},
     sync::{
         atomic::{AtomicBool, AtomicIsize, Ordering},
         mpsc, Arc, OnceLock,
@@ -242,20 +243,20 @@ struct State {
     owner: isize,
     token: FlowToken,
     monitor: Monitor,
-    selection: Selection,
+    selection: RefCell<Selection>,
     result: mpsc::SyncSender<OverlayEvent>,
     repaint: Box<dyn Fn() + Send>,
-    terminal: bool,
-    label: HWND,
-    confirm: HWND,
-    font: HFONT,
+    terminal: Cell<bool>,
+    label: Cell<HWND>,
+    confirm: Cell<HWND>,
+    font: Cell<HFONT>,
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        if !self.font.is_invalid() {
+        if !self.font.get().is_invalid() {
             // SAFETY: All child controls are destroyed before this owning-thread font is released.
-            if !unsafe { DeleteObject(self.font) }.as_bool() {
+            if !unsafe { DeleteObject(self.font.get()) }.as_bool() {
                 eprintln!(
                     "Region selector font release failed: {}",
                     windows::core::Error::from_win32()
@@ -285,19 +286,19 @@ impl Overlay {
         let live = handle.clone();
         let cancelled = closing.clone();
         let thread = thread::spawn(move || {
-            let mut state = State {
+            let state = State {
                 owner,
                 token,
-                selection: Selection::new(&monitor, initial),
+                selection: RefCell::new(Selection::new(&monitor, initial)),
                 monitor,
                 result: tx,
                 repaint: Box::new(repaint),
-                terminal: false,
-                label: HWND::default(),
-                confirm: HWND::default(),
-                font: HFONT::default(),
+                terminal: Cell::new(false),
+                label: Cell::new(HWND::default()),
+                confirm: Cell::new(HWND::default()),
+                font: Cell::new(HFONT::default()),
             };
-            let outcome = run_overlay(&mut state, &live, &cancelled, &ready);
+            let outcome = run_overlay(&state, &live, &cancelled, &ready);
             if let Err(error) = outcome {
                 let _ = ready.try_send(Err(format!("{error:#}")));
                 let _ = state.result.try_send(OverlayEvent {
@@ -347,7 +348,7 @@ impl Drop for Overlay {
 }
 
 fn run_overlay(
-    state: &mut State,
+    state: &State,
     handle: &AtomicIsize,
     closing: &AtomicBool,
     ready: &mpsc::SyncSender<std::result::Result<(), String>>,
@@ -389,7 +390,7 @@ fn run_overlay(
             None,
             None,
             instance,
-            Some(state as *mut State as *const _),
+            Some(state as *const State as *const _),
         )?;
         handle.store(hwnd.0 as isize, Ordering::Release);
         let setup = (|| -> Result<()> {
@@ -409,13 +410,13 @@ fn run_overlay(
             for (slot, unit) in font.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
                 *slot = unit;
             }
-            state.font = CreateFontIndirectW(&font);
+            state.font.set(CreateFontIndirectW(&font));
             ensure!(
-                !state.font.is_invalid(),
+                !state.font.get().is_invalid(),
                 "The region selector's DPI-scaled control font could not be created."
             );
             let x = (state.monitor.width as i32 - unit(640)).max(0) / 2;
-            state.label = CreateWindowExW(
+            state.label.set(CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("STATIC"),
                 w!("Drag a region. Resize handles or move inside. Esc to cancel."),
@@ -428,8 +429,8 @@ fn run_overlay(
                 None,
                 instance,
                 None,
-            )?;
-            state.confirm = CreateWindowExW(
+            )?);
+            state.confirm.set(CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("BUTTON"),
                 w!("Review sources"),
@@ -442,7 +443,7 @@ fn run_overlay(
                 HMENU(ACCEPT as *mut _),
                 instance,
                 None,
-            )?;
+            )?);
             let cancel = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("BUTTON"),
@@ -457,11 +458,11 @@ fn run_overlay(
                 instance,
                 None,
             )?;
-            for control in [state.label, state.confirm, cancel] {
+            for control in [state.label.get(), state.confirm.get(), cancel] {
                 SendMessageW(
                     control,
                     WM_SETFONT,
-                    WPARAM(state.font.0 as usize),
+                    WPARAM(state.font.get().0 as usize),
                     LPARAM(1),
                 );
             }
@@ -503,7 +504,9 @@ fn run_overlay(
 }
 
 fn update_label(state: &State) -> Result<()> {
-    let label = match state.selection.rect {
+    let rectangle = state.selection.borrow().rect;
+    let accepted = state.selection.borrow().accepted().is_some();
+    let label = match rectangle {
         Some(r) => format!(
             "{} x {} px   |   drag to move; handles to resize   |   Esc to cancel",
             r.width, r.height
@@ -512,21 +515,40 @@ fn update_label(state: &State) -> Result<()> {
     };
     // SAFETY: Child controls belong to this live overlay on the current thread.
     unsafe {
-        SetWindowTextW(state.label, &HSTRING::from(label))?;
-        let _ = EnableWindow(state.confirm, state.selection.accepted().is_some());
+        SetWindowTextW(state.label.get(), &HSTRING::from(label))?;
+        let _ = EnableWindow(state.confirm.get(), accepted);
     }
     Ok(())
 }
 
-fn finish(hwnd: HWND, state: &mut State, result: std::result::Result<Option<Area>, String>) {
-    if state.terminal {
+fn release_gesture(
+    selection: &RefCell<Selection>,
+    position: Option<(i32, i32)>,
+    release: impl FnOnce(),
+) {
+    {
+        let mut selection = selection.borrow_mut();
+        if let Some((x, y)) = position {
+            selection.up(x, y);
+        } else {
+            selection.cancel();
+        }
+    }
+    release();
+}
+
+fn finish(hwnd: HWND, state: &State, result: std::result::Result<Option<Area>, String>) {
+    if state.terminal.replace(true) {
         return;
     }
-    state.terminal = true;
-    state.selection.cancel();
+    release_gesture(&state.selection, None, || {
+        // SAFETY: Release only this thread's capture after all mutable model borrows have ended.
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    });
     // SAFETY: Only this thread's input capture and overlay window are released.
     let closed = unsafe {
-        let _ = ReleaseCapture();
         let closed = DestroyWindow(hwnd);
         PostQuitMessage(0);
         closed
@@ -585,18 +607,20 @@ unsafe extern "system" fn window_proc(
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
     // SAFETY: State outlives the message loop; callbacks are serialized on this window's thread.
-    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut State;
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const State;
     if pointer.is_null() {
         // SAFETY: Default processing for messages before our State is attached.
         return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
-    // SAFETY: The exclusive callback is the sole user of State during the native message loop.
-    let state = unsafe { &mut *pointer };
+    // SAFETY: Same-thread reentrant callbacks share State. Mutations use short Cell/RefCell
+    // borrows that always end before a Win32 call capable of synchronous reentry.
+    let state = unsafe { &*pointer };
     let x = (lparam.0 as u16 as i16) as i32;
     let y = ((lparam.0 >> 16) as u16 as i16) as i32;
     match message {
         WM_CAPTURECHANGED => {
-            if lparam.0 != hwnd.0 as isize && state.selection.capture_lost() {
+            let lost = lparam.0 != hwnd.0 as isize && state.selection.borrow_mut().capture_lost();
+            if lost {
                 finish(hwnd, state, Ok(None));
             }
             LRESULT(0)
@@ -623,7 +647,8 @@ unsafe extern "system" fn window_proc(
         WM_COMMAND => {
             match wparam.0 & 0xffff {
                 ACCEPT => {
-                    if let Some(rect) = state.selection.accepted() {
+                    let accepted = state.selection.borrow().accepted();
+                    if let Some(rect) = accepted {
                         finish(hwnd, state, Ok(Some(rect.area(&state.monitor.id))));
                     }
                 }
@@ -636,7 +661,8 @@ unsafe extern "system" fn window_proc(
             if wparam.0 == 0x1b {
                 finish(hwnd, state, Ok(None));
             } else if wparam.0 == 0x0d {
-                if let Some(rect) = state.selection.accepted() {
+                let accepted = state.selection.borrow().accepted();
+                if let Some(rect) = accepted {
                     finish(hwnd, state, Ok(Some(rect.area(&state.monitor.id))));
                 }
             } else {
@@ -658,13 +684,13 @@ unsafe extern "system" fn window_proc(
                     0x28 => (0, step),
                     _ => (0, 0),
                 };
-                state.selection.nudge(dx, dy, resize);
+                state.selection.borrow_mut().nudge(dx, dy, resize);
                 refresh(hwnd, state);
             }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            state.selection.down(x, y);
+            state.selection.borrow_mut().down(x, y);
             // SAFETY: The overlay owns input only for the lifetime of this mouse drag.
             unsafe {
                 let _ = SetCapture(hwnd);
@@ -675,10 +701,12 @@ unsafe extern "system" fn window_proc(
         WM_MOUSEMOVE => {
             // SAFETY: Query this thread's current mouse-capture owner without changing it.
             let captured = unsafe { GetCapture() } == hwnd;
-            if !state
-                .selection
-                .captured_motion(x, y, wparam.0 & 1 != 0, captured)
-            {
+            let valid =
+                state
+                    .selection
+                    .borrow_mut()
+                    .captured_motion(x, y, wparam.0 & 1 != 0, captured);
+            if !valid {
                 finish(hwnd, state, Ok(None));
                 return LRESULT(0);
             }
@@ -686,7 +714,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            if !state.selection.dragging() {
+            if !state.selection.borrow().dragging() {
                 return LRESULT(0);
             }
             // SAFETY: A late mouse-up without this overlay's capture cannot finish a gesture.
@@ -694,11 +722,12 @@ unsafe extern "system" fn window_proc(
                 finish(hwnd, state, Ok(None));
                 return LRESULT(0);
             }
-            state.selection.up(x, y);
-            // SAFETY: Balance this window's mouse-down capture.
-            unsafe {
-                let _ = ReleaseCapture();
-            }
+            release_gesture(&state.selection, Some((x, y)), || {
+                // SAFETY: No RefMut survives across the synchronous WM_CAPTURECHANGED callback.
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+            });
             refresh(hwnd, state);
             LRESULT(0)
         }
@@ -713,8 +742,8 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn refresh(hwnd: HWND, state: &mut State) {
-    if state.terminal {
+fn refresh(hwnd: HWND, state: &State) {
+    if state.terminal.get() {
         return;
     }
     if let Err(error) = update_label(state) {
@@ -732,6 +761,7 @@ fn refresh(hwnd: HWND, state: &mut State) {
 }
 
 fn paint(hwnd: HWND, state: &State) {
+    let selected_rect = state.selection.borrow().rect;
     // SAFETY: Every GDI object is restored/deleted before EndPaint on this owning thread.
     unsafe {
         let mut paint = PAINTSTRUCT::default();
@@ -745,7 +775,7 @@ fn paint(hwnd: HWND, state: &State) {
         };
         FillRect(dc, &whole, background);
         let _ = DeleteObject(background);
-        if let Some(r) = state.selection.rect {
+        if let Some(r) = selected_rect {
             let selected = CreateSolidBrush(COLORREF(0x006e8278));
             let rect = RECT {
                 left: r.x as i32,
@@ -788,6 +818,75 @@ fn paint(hwnd: HWND, state: &State) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn release_capture_seam_allows_synchronous_native_capturechanged_reentry() {
+        use crate::capture::CaptureFlow;
+        let monitor = Monitor {
+            id: "fixture".into(),
+            left: 0,
+            top: 0,
+            width: 640,
+            height: 360,
+            primary: true,
+            dpi: 96,
+        };
+        let (result, _events) = mpsc::sync_channel(1);
+        let state = State {
+            owner: 0,
+            token: CaptureFlow::default().begin().unwrap(),
+            selection: RefCell::new(Selection::new(&monitor, None)),
+            monitor,
+            result,
+            repaint: Box::new(|| {}),
+            terminal: Cell::new(false),
+            label: Cell::new(HWND::default()),
+            confirm: Cell::new(HWND::default()),
+            font: Cell::new(HFONT::default()),
+        };
+        // SAFETY: This creates an invisible message-only test window. It never takes
+        // focus or real mouse capture; SendMessage supplies the synchronous callback.
+        unsafe {
+            let instance = HINSTANCE(GetModuleHandleW(None).unwrap().0);
+            let class = w!("Snapper.SelectionReentryTest");
+            let registration = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance,
+                lpszClassName: class,
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&registration), 0);
+            let window = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class,
+                w!(""),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                None,
+                instance,
+                Some(&state as *const State as *const _),
+            )
+            .unwrap();
+            state.selection.borrow_mut().down(20, 20);
+            state.selection.borrow_mut().motion(120, 120);
+            release_gesture(&state.selection, Some((120, 120)), || {
+                SendMessageW(window, WM_CAPTURECHANGED, WPARAM(0), LPARAM(0));
+            });
+            assert_eq!(state.selection.borrow().accepted().unwrap().width, 100);
+            state.selection.borrow_mut().down(60, 60);
+            release_gesture(&state.selection, None, || {
+                SendMessageW(window, WM_CAPTURECHANGED, WPARAM(0), LPARAM(0));
+            });
+            assert!(state.selection.borrow().accepted().is_none());
+            DestroyWindow(window).unwrap();
+            UnregisterClassW(class, instance).unwrap();
+            let mut message = MSG::default();
+            let _ = PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_REMOVE);
+        }
+    }
     #[test]
     fn window_guidance_is_fixed_physical_region_not_cross_monitor_capture() {
         let monitor = Monitor {

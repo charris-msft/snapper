@@ -40,6 +40,7 @@ pub(super) struct CaptureUi {
     pending_delivery: Option<(String, CaptureOptions)>,
     shortcut_draft: Shortcuts,
     preset_name: String,
+    attempt_error: Option<String>,
 }
 
 impl CaptureUi {
@@ -97,6 +98,7 @@ impl CaptureUi {
             active_options: None,
             pending_delivery: None,
             preset_name: String::new(),
+            attempt_error: None,
         })
     }
 
@@ -129,7 +131,9 @@ impl Editor {
         match result {
             Ok(()) => true,
             Err(error) => {
-                self.error = Some(format!("{error:#}"));
+                let message = format!("{error:#}");
+                self.capture_ui.attempt_error = Some(message.clone());
+                self.error = Some(message);
                 false
             }
         }
@@ -253,11 +257,13 @@ impl Editor {
                     .find(|m| m.id == area.monitor)
                     .cloned();
                 self.capture_ui.flow.selected(token, area);
+                self.selection_succeeded();
                 self.show_launcher(ctx);
                 selection::show_owned(self.window_handle, true)?;
             } else if target == TargetKind::Monitor {
                 self.capture_ui.area = monitor.area();
                 self.capture_ui.flow.selected(token, monitor.area());
+                self.selection_succeeded();
                 self.show_launcher(ctx);
                 selection::show_owned(self.window_handle, true)?;
             } else {
@@ -292,8 +298,17 @@ impl Editor {
         })();
         if let Err(error) = result {
             self.cancel_capture_flow(ctx);
-            self.error = Some(format!("{error:#}"));
+            let message = format!("{error:#}");
+            self.capture_ui.attempt_error = Some(message.clone());
+            self.error = Some(message);
         }
+    }
+
+    fn selection_succeeded(&mut self) {
+        if self.error.as_ref() == self.capture_ui.attempt_error.as_ref() {
+            self.error = None;
+        }
+        self.capture_ui.attempt_error = None;
     }
 
     pub(super) fn cancel_capture_flow(&mut self, ctx: &egui::Context) {
@@ -640,6 +655,7 @@ impl Editor {
                     Ok(Some(area)) => {
                         self.capture_ui.area = area.clone();
                         self.capture_ui.flow.selected(event.token, area);
+                        self.selection_succeeded();
                         self.show_launcher(ctx);
                         self.capture_notice(selection::show_owned(self.window_handle, true));
                     }

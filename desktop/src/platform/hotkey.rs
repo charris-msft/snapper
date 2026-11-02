@@ -16,9 +16,12 @@ use windows::Win32::{
             RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
             MOD_NOREPEAT, MOD_SHIFT, VK_ESCAPE, VK_F9,
         },
-        WindowsAndMessaging::{GetMessageW, PostThreadMessageW, MSG, WM_HOTKEY, WM_QUIT},
+        WindowsAndMessaging::{
+            GetMessageW, PeekMessageW, PostThreadMessageW, MSG, PM_REMOVE, WM_APP, WM_HOTKEY,
+        },
     },
 };
+const SHUTDOWN: u32 = WM_APP + 71;
 
 pub struct GlobalStop {
     pub flag: Arc<AtomicBool>,
@@ -73,6 +76,17 @@ impl GlobalStop {
         cancellation: Option<Arc<CaptureAdmission>>,
         repaint: impl Fn() + Send + 'static,
     ) -> Result<Self> {
+        Self::with_dispatch(key, modifiers, label, cancellation, None, repaint)
+    }
+
+    fn with_dispatch(
+        key: u32,
+        modifiers: HOT_KEY_MODIFIERS,
+        label: &str,
+        cancellation: Option<Arc<CaptureAdmission>>,
+        after_dequeue: Option<Box<dyn Fn() + Send>>,
+        repaint: impl Fn() + Send + 'static,
+    ) -> Result<Self> {
         let flag = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let id = Arc::new(AtomicU32::new(0));
@@ -93,8 +107,27 @@ impl GlobalStop {
                     return;
                 }
                 let _ = ready.send(Ok(()));
+                let dispatch = || {
+                    if let Some(gate) = &cancellation {
+                        gate.cancel();
+                    } else {
+                        stop.store(true, Ordering::Release);
+                        if let Some(gate) = active_target
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                        {
+                            gate.cancel();
+                        }
+                    }
+                    repaint();
+                };
                 let mut message = MSG::default();
-                while !closing.load(Ordering::Acquire) {
+                if closing.load(Ordering::Acquire) {
+                    let _ =
+                        PostThreadMessageW(GetCurrentThreadId(), SHUTDOWN, WPARAM(0), LPARAM(0));
+                }
+                loop {
                     let status = GetMessageW(&mut message, None, 0, 0).0;
                     if status == 0 {
                         break;
@@ -107,29 +140,27 @@ impl GlobalStop {
                         repaint();
                         break;
                     }
-                    if closing.load(Ordering::Acquire) {
+                    if message.message == SHUTDOWN {
                         break;
                     }
                     if message.message == WM_HOTKEY && message.wParam.0 == 1 {
-                        if let Some(gate) = &cancellation {
-                            gate.cancel();
-                        } else {
-                            stop.store(true, Ordering::Release);
-                            if let Some(gate) = active_target
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .clone()
-                            {
-                                gate.cancel();
-                            }
+                        if let Some(hook) = &after_dequeue {
+                            hook();
                         }
-                        repaint();
+                        dispatch();
                     }
                 }
                 if let Err(e) = UnregisterHotKey(None, 1) {
                     *errors.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(format!("Global Stop shortcut release failed: {e}"));
                     repaint();
+                }
+                // Registration is now closed. Dispatch already queued signals before
+                // releasing this generation; disposal itself never manufactures Escape.
+                while PeekMessageW(&mut message, None, WM_HOTKEY, WM_HOTKEY, PM_REMOVE).as_bool() {
+                    if message.wParam.0 == 1 {
+                        dispatch();
+                    }
                 }
             }
         });
@@ -164,7 +195,7 @@ impl Drop for GlobalStop {
         let id = self.id.load(Ordering::Acquire);
         if id != 0 {
             // SAFETY: This is our registration thread, never a foreground app or global queue.
-            if let Err(e) = unsafe { PostThreadMessageW(id, WM_QUIT, WPARAM(0), LPARAM(0)) } {
+            if let Err(e) = unsafe { PostThreadMessageW(id, SHUTDOWN, WPARAM(0), LPARAM(0)) } {
                 if self.thread.as_ref().is_some_and(|t| !t.is_finished()) {
                     eprintln!("Global Stop shutdown notification: {e}");
                 }
@@ -214,6 +245,70 @@ impl GlobalShortcuts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn escape_returned_by_getmessage_survives_disposal_after_admission() {
+        use crate::capture::CaptureFlow;
+        use std::sync::Barrier;
+        let token = CaptureFlow::default().begin().unwrap();
+        let gate = Arc::new(CaptureAdmission::new(token));
+        let recorder_stop = gate.admit(token, |stop| stop).unwrap();
+        let dequeued = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let arrived = dequeued.clone();
+        let release = resume.clone();
+        let hotkey = GlobalStop::with_dispatch(
+            0x85,
+            MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+            "dequeued cancellation test",
+            Some(gate),
+            Some(Box::new(move || {
+                arrived.wait();
+                release.wait();
+            })),
+            || {},
+        )
+        .unwrap();
+        let closing = hotkey.shutdown.clone();
+        // SAFETY: Post only to the actual handler's test-owned queue, not physical input.
+        unsafe {
+            PostThreadMessageW(
+                hotkey.id.load(Ordering::Acquire),
+                WM_HOTKEY,
+                WPARAM(1),
+                LPARAM(0),
+            )
+            .unwrap();
+        }
+        dequeued.wait();
+        let disposing = thread::spawn(move || drop(hotkey));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !closing.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(closing.load(Ordering::Acquire));
+        resume.wait();
+        disposing.join().unwrap();
+        assert!(recorder_stop.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn normal_registration_disposal_does_not_stop_an_admitted_recording() {
+        use crate::capture::CaptureFlow;
+        let token = CaptureFlow::default().begin().unwrap();
+        let gate = Arc::new(CaptureAdmission::new(token));
+        let stop = gate.admit(token, |stop| stop).unwrap();
+        drop(
+            GlobalStop::with_binding(
+                0x84,
+                MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+                "normal disposal test",
+                Some(gate),
+                || {},
+            )
+            .unwrap(),
+        );
+        assert!(!stop.load(Ordering::Acquire));
+    }
     #[test]
     fn delivered_cancellation_during_final_preflight_prevents_all_start_side_effects() {
         use crate::capture::CaptureFlow;

@@ -23,6 +23,7 @@ is built independently under `desktop`; it does not replace the default CLI
 route, call synchronous `PrintWindow` on its UI thread, or require the Go
 binary for desktop capture.
 
-The consolidation is local-only. The existing repository is public, but
-local integration and local packaging do not authorize a push, release,
-external upload or replacement of an installed CLI.
+The existing repository is public. Local integration and packaging do not by
+themselves authorize source publication, a release, an external upload or
+replacement of an installed CLI. Each requires explicit approval at its own
+scope. Local captures, private evidence and toolchains are not source artifacts.

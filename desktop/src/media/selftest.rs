@@ -113,6 +113,10 @@ pub fn pause_tests(root: &Path) -> Result<()> {
     }
     for (name, result) in [
         (
+            "video-only-paused-tail-after-slow-write",
+            paused_video_tail(&run.join("paused-tail")),
+        ),
+        (
             "pause-stalled-writer-then-stop",
             pause_stalled_writer(&run.join("stalled-writer")),
         ),
@@ -290,8 +294,12 @@ fn pause_capture(root: &Path, mask: u8, stop_paused: bool) -> Result<Value> {
             "Resumed video pulse offset was {video:.3}s; expected 0.500s +/-120 ms."
         );
         if mask & 12 != 0 {
-            let (system, mic) =
-                super::profile::audio_edges(&output, start, &root.join("resume-audio.f32le"))?;
+            let (system, mic) = super::profile::audio_edges(
+                &output,
+                start,
+                next_wall_pulse as u64,
+                &root.join("resume-audio.f32le"),
+            )?;
             ensure!((system - video).abs() <= 0.12 && (mic - video).abs() <= 0.12,
                 "A/V timing changed across resume: video={video:.3}s system={system:.3}s microphone={mic:.3}s.");
             sync = json!({"video":video,"system":system,"microphone":mic,"tolerance_seconds":0.12});
@@ -311,6 +319,77 @@ fn pause_capture(root: &Path, mask: u8, stop_paused: bool) -> Result<Value> {
         "elapsed_media_ms":progress.elapsed_ms,"wall_elapsed_ms":progress.wall_elapsed_ms,
         "pause_wall_sample":paused.control_wall_sample,"pause_media_sample":paused.control_media_sample,
         "sync":sync,"audio_queue_peak_bytes":progress.peak_audio_queue_bytes}),
+    )
+}
+
+fn paused_video_tail(root: &Path) -> Result<Value> {
+    let mut request = request(root, 0)?;
+    request.max_seconds = 5;
+    request.test_fault = Some(TestFault::SlowVideoWrite);
+    let recorder = Recorder::start(request.clone());
+    await_progress(&recorder, Duration::from_secs(15), |p| {
+        p.phase == Phase::Recording && request.session_dir.join("fault-fired.json").is_file()
+    })?;
+    recorder.pause()?;
+    let paused = await_progress(&recorder, Duration::from_secs(3), |p| {
+        p.phase == Phase::Paused
+    })?;
+    ensure!(
+        paused.elapsed_ms.saturating_sub(paused.last_write_ms) >= 350,
+        "Controlled slow-write fixture did not create its intended held-frame gap."
+    );
+    recorder.stop();
+    let saved = await_saved(&recorder)?;
+    let journal: encoder::Journal = library::read_json(&request.session_dir.join("journal.json"))?;
+    let output = journal.output.context("Video-only paused output missing")?;
+    let data = probe(&output, root)?;
+    let stream = data["streams"]
+        .as_array()
+        .context("No paused output streams")?
+        .iter()
+        .find(|s| s["codec_type"] == "video")
+        .context("No paused output video")?;
+    let video_end = stream["duration"]
+        .as_str()
+        .context("Paused video duration missing")?
+        .parse::<f64>()?;
+    let container_end = data["format"]["duration"]
+        .as_str()
+        .context("Paused container duration missing")?
+        .parse::<f64>()?;
+    let expected = paused.control_media_sample as f64 / 48000.0;
+    ensure!((video_end-expected).abs()<=0.04 && (container_end-expected).abs()<=0.04,
+        "Held frame was not sealed: active={expected:.3}s, video={video_end:.3}s, container={container_end:.3}s.");
+    let tail = frame(
+        &output,
+        (expected - 0.05).max(0.0),
+        &root.join("held-tail.png"),
+    )?;
+    let identity = super::profile::marker_second(&tail, false)?;
+    ensure!(
+        u64::from(identity) == paused.last_write_ms / 1000,
+        "Finalization sampled a paused source instead of retaining the last admitted pixels."
+    );
+    let recovered = encoder::recover(&request.session_dir)?;
+    let recovered_path = Library::open(request.library_root.clone())?
+        .capture_dir(&recovered)?
+        .join("recording.mp4");
+    let recovered_probe = probe(&recovered_path, root)?;
+    let recovered_end = recovered_probe["format"]["duration"]
+        .as_str()
+        .context("Recovered duration missing")?
+        .parse::<f64>()?;
+    ensure!(
+        (recovered_end - expected).abs() <= 0.04,
+        "Recovered held-frame endpoint changed."
+    );
+    ensure!(
+        saved.elapsed_ms == paused.control_media_sample / 48,
+        "Finalization changed acknowledged media elapsed."
+    );
+    Ok(
+        json!({"active_end_seconds":expected,"video_end_seconds":video_end,"container_end_seconds":container_end,
+        "recovered_end_seconds":recovered_end,"held_source_second":identity,"output":output}),
     )
 }
 

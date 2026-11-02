@@ -49,14 +49,21 @@ not a ready-to-run target; replace the monitor placeholder using current
 }
 ```
 
-After approval, invoke the packaged executable:
+After approval, invoke the source checkout's verification wrapper against the
+exact packaged executable:
 
 ```powershell
-.\snapper-desktop.exe --native-profile <request.json> <evidence-directory> --approve-screen-capture
+.\scripts\Verify.ps1 -PackagePath <package-directory> -Suite Native `
+  -RequestPath <request.json> -EvidencePath <evidence-directory> -ApproveScreenCapture
 ```
 
 Each pass uses a fresh evidence library/session rather than overwriting the
 request's storage. No output is uploaded.
+
+The Release executable has the Windows GUI subsystem. A bare PowerShell
+invocation can return before a diagnostic process finishes and can close its
+output pipe. The wrapper uses `ProcessStartInfo`, redirected output and
+`WaitForExit`; do not infer completion from an immediately returning shell.
 
 ## Measurements and interpretation
 
@@ -91,7 +98,7 @@ audio sources are OFF. Same-build generated A/V tests remain a separate check.
 ## Encoder availability
 
 ```powershell
-.\snapper-desktop.exe --encoder-diagnostics <evidence-directory>
+.\scripts\Verify.ps1 -PackagePath <package-directory> -Suite Encoders -EvidencePath <evidence-directory>
 ```
 
 This bounded check feeds 30 generated 1280x720 frames to the pinned FFmpeg's
@@ -104,3 +111,7 @@ The current recording path is explicitly **libx264 software H.264**. A new
 encoder or fallback must independently satisfy timestamp, bounded-queue,
 segment-finalization, recovery, provenance and local packaging gates before
 being selected.
+
+The same wrapper runs a short generated, not native, timing profile with
+`-Suite Profile -ProfileSeconds 12`. This is separate from the approved screen
+measurement and is never substituted for it.

@@ -36,6 +36,7 @@ pub enum TestFault {
     AfterFinalRename,
     FinalDrainStall,
     VideoDeliveryJitter,
+    SlowVideoWrite,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {

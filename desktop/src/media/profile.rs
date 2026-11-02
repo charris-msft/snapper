@@ -500,14 +500,35 @@ fn record(root: &Path, seconds: u64, load: bool) -> Result<Value> {
             886,
             &root.join(format!("camera-{start}.gray")),
         )?;
-        let (system, microphone) =
-            audio_edges(&output, start, &root.join(format!("sound-{start}.pcm")))?;
+        let screen_image = selftest::frame(
+            &output,
+            start + screen + 0.02,
+            &root.join(format!("screen-identity-{start}.png")),
+        )?;
+        let camera_image = selftest::frame(
+            &output,
+            start + camera + 0.02,
+            &root.join(format!("camera-identity-{start}.png")),
+        )?;
+        let marker = marker_second(&screen_image, false)?;
+        ensure!(
+            marker == marker_second(&camera_image, true)?,
+            "Screen and camera pulses identify different source seconds."
+        );
+        let (system, microphone) = audio_edges(
+            &output,
+            start,
+            u64::from(marker),
+            &root.join(format!("sound-{start}.pcm")),
+        )?;
         let system_offset = system - screen;
         let microphone_offset = microphone - screen;
         let camera_offset = camera - screen;
         ensure!(system_offset.abs()<=0.1&&microphone_offset.abs()<=0.1&&camera_offset.abs()<=0.1,
             "A/V marker mismatch at {start}s: screen {screen:.3}, camera {camera:.3}, system {system:.3}, mic {microphone:.3}.");
-        offsets.push(json!({"window_start":start,"screen_edge":screen,"camera_edge":camera,
+        offsets.push(json!({"window_start":start,"marker_source_second":marker,
+            "missed_visual_pulses":(start.ceil() as u16..marker).collect::<Vec<_>>(),
+            "screen_edge":screen,"camera_edge":camera,
             "system_audio_edge":system,"microphone_edge":microphone,
             "system_offset_ms":system_offset*1000.0,"microphone_offset_ms":microphone_offset*1000.0,"camera_offset_ms":camera_offset*1000.0}));
     }
@@ -582,7 +603,45 @@ pub(super) fn video_edge(path: &Path, start: f64, x: u32, y: u32, target: &Path)
     Ok(index as f64 / 100.0)
 }
 
-pub(super) fn audio_edges(path: &Path, start: f64, target: &Path) -> Result<(f64, f64)> {
+pub(super) fn marker_second(image: &image::RgbaImage, camera: bool) -> Result<u16> {
+    let width = image.width();
+    let height = image.height();
+    ensure!(
+        width >= 80 && height >= 32,
+        "Generated identity image is too small."
+    );
+    let read = |x: u32| {
+        let (x, y) = if camera {
+            let w = (width / 4).clamp(1, 360);
+            let h = (w * 180 / 320).min(height).max(1);
+            (
+                width.saturating_sub(w + 12) + x * w / 320,
+                height.saturating_sub(h + 12) + 168 * h / 180,
+            )
+        } else {
+            (x, height - 12)
+        };
+        image.get_pixel(x, y).0
+    };
+    ensure!(
+        read(66)[..3].iter().all(|c| *c > 190) && read(72)[..3].iter().all(|c| *c < 60),
+        "Generated frame identity sentinels are missing."
+    );
+    let mut second = 0u16;
+    for bit in 0..16 {
+        if read(bit * 4 + 2)[..3].iter().all(|c| *c > 160) {
+            second |= 1 << bit;
+        }
+    }
+    Ok(second)
+}
+
+pub(super) fn audio_edges(
+    path: &Path,
+    start: f64,
+    marker: u64,
+    target: &Path,
+) -> Result<(f64, f64)> {
     let mut command = process::command(&process::media_tool("ffmpeg")?);
     command
         .args(["-v", "error", "-ss", &format!("{start:.3}"), "-i"])
@@ -610,12 +669,58 @@ pub(super) fn audio_edges(path: &Path, start: f64, target: &Path) -> Result<(f64
         }
         anyhow::bail!("The {frequency} Hz timing pulse was not decoded.")
     };
-    Ok((onset(1200.0)?, onset(2400.0)?))
+    Ok((
+        onset(super::worker::pulse_frequency(true, marker))?,
+        onset(super::worker::pulse_frequency(false, marker))?,
+    ))
 }
 
 #[cfg(test)]
 mod measurement_tests {
     use super::*;
+    #[test]
+    fn generated_marker_identity_is_independent_of_a_missing_previous_flash() {
+        for second in [1, 10, 11, 257, 599] {
+            let screen =
+                super::super::worker::synthetic_frame(640, 360, second * 1000, false, false)
+                    .unwrap();
+            let camera =
+                super::super::worker::synthetic_frame(320, 180, second * 1000, false, true)
+                    .unwrap();
+            let mut pixels = vec![0; 640 * 360 * 4];
+            super::super::worker::composite_frame(&screen, Some(&camera), 640, 360, &mut pixels);
+            let image = crate::platform::Frame {
+                width: 640,
+                height: 360,
+                bgra: pixels,
+                timestamp: 0,
+            }
+            .into_rgba()
+            .unwrap();
+            assert_eq!(marker_second(&image, false).unwrap(), second as u16);
+            assert_eq!(marker_second(&image, true).unwrap(), second as u16);
+        }
+        assert!(marker_second(&image::RgbaImage::new(640, 360), false).is_err());
+    }
+
+    #[test]
+    fn audio_identity_does_not_match_an_adjacent_second() {
+        for system in [false, true] {
+            let pcm = super::super::worker::generated_pcm(11 * 48000, 4800, system);
+            let samples: Vec<_> = pcm
+                .chunks_exact(4)
+                .map(|p| i16::from_le_bytes([p[0], p[1]]) as f32 / 32768.0)
+                .collect();
+            assert!(
+                selftest::amplitude(&samples, super::super::worker::pulse_frequency(system, 11))
+                    > 0.15
+            );
+            assert!(
+                selftest::amplitude(&samples, super::super::worker::pulse_frequency(system, 10))
+                    < 0.01
+            );
+        }
+    }
     #[test]
     fn native_profile_refuses_unapproved_screen_or_private_inputs_before_creating_evidence() {
         let directory = tempfile::tempdir().unwrap();

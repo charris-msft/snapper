@@ -19,6 +19,11 @@ cancellation that wins cannot call the recording factory. If start wins, a
 concurrent signal sets that generation's unique Stop flag. Old registrations
 cannot stop a newly opened capture generation. GUI-frame polling is not the
 admission boundary.
+Registration teardown is ordered through its native message queue. Already
+returned/queued hotkey messages are dispatched before disposal; disposal alone
+does not manufacture cancellation. Native selection state uses same-thread
+interior mutability, with no mutable model borrow crossing `ReleaseCapture`
+or another synchronously reentrant Win32 call.
 
 `editor::capture_ui` provides a compact launcher, source preflight and movable
 recording dock rather than embedding capture controls in the image workspace.
@@ -110,6 +115,10 @@ Pending PCM stays charged to the queue budget until written or discarded.
 Prepared output spans are bounded to 100 ms. Stop freezes an immutable media
 endpoint before device joins and final draining; it never waits for Resume.
 Duration limits measure active media time, not paused wall time.
+If a slow final write leaves a presentation gap before that frozen endpoint,
+finalization seals the held last admitted frame. It reuses the already admitted
+pixels and never samples a paused source. Video-only recordings therefore do
+not depend on an audio track to extend their saved/recovered duration.
 
 FFmpeg uses two encoder threads, one complex-filter thread, a two-packet input
 queue, no B frames, a finite muxing queue and a one-second mux-interleave bound.
