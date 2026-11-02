@@ -341,7 +341,10 @@ fn paused_video_tail(root: &Path) -> Result<Value> {
     recorder.stop();
     let saved = await_saved(&recorder)?;
     let journal: encoder::Journal = library::read_json(&request.session_dir.join("journal.json"))?;
-    let output = journal.output.context("Video-only paused output missing")?;
+    let output = journal
+        .output
+        .clone()
+        .context("Video-only paused output missing")?;
     let data = probe(&output, root)?;
     let stream = data["streams"]
         .as_array()
@@ -370,8 +373,30 @@ fn paused_video_tail(root: &Path) -> Result<Value> {
         u64::from(identity) == paused.last_write_ms / 1000,
         "Finalization sampled a paused source instead of retaining the last admitted pixels."
     );
-    let recovered = encoder::recover(&request.session_dir)?;
-    let recovered_path = Library::open(request.library_root.clone())?
+    // Replay copied committed segments as an interrupted session. The completed
+    // source session must remain complete and must not be rewritten for this test.
+    let replay_library = Library::open(root.join("recovery-copy"))?;
+    let replay_directory = replay_library.root.join("sessions").join(library::id());
+    fs::create_dir(&replay_directory)?;
+    for segment in &journal.segments {
+        library::copy_file_new(
+            &request.session_dir.join(&segment.file),
+            &replay_directory.join(&segment.file),
+        )?;
+    }
+    let mut replay = journal.clone();
+    replay.request.library_root = replay_library.root.clone();
+    replay.request.session_dir = replay_directory.clone();
+    replay.request.test_fault = None;
+    replay.completed = false;
+    replay.recovered = false;
+    replay.output = None;
+    replay.final_publication = None;
+    replay.interrupted =
+        Some("Generated held-tail recovery replay from copied committed segments.".into());
+    library::write_json(&replay_directory.join("journal.json"), &replay)?;
+    let recovered = encoder::recover(&replay_directory)?;
+    let recovered_path = replay_library
         .capture_dir(&recovered)?
         .join("recording.mp4");
     let recovered_probe = probe(&recovered_path, root)?;
