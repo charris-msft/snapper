@@ -15,6 +15,7 @@ struct Pending {
     sample: u64,
     offset: usize,
     packet: Packet,
+    previous_packet: Option<PacketTiming>,
     device_gap: Option<(u64, u64)>,
 }
 
@@ -61,6 +62,7 @@ impl AudioTimeline {
 
     fn observe_packet(&mut self, packet: Packet, observed: i64) -> Result<bool> {
         let timing = packet.timing;
+        let previous_packet = self.last_packet;
         timing.validate()?;
         ensure!(
             packet.pcm.len() == timing.frames as usize * 4,
@@ -113,6 +115,7 @@ impl AudioTimeline {
             sample,
             offset: trim,
             packet,
+            previous_packet,
             device_gap,
         });
         Ok(discontinuity)
@@ -190,6 +193,12 @@ impl AudioTimeline {
                 return Ok(None);
             }
             let timing = front.packet.timing;
+            let previous_packet = front.previous_packet;
+            let predecessor = || {
+                previous_packet
+                    .map(|packet| packet.to_string())
+                    .unwrap_or_else(|| "none".into())
+            };
             let source = source_label(self.system);
             let available =
                 (timing.frames as usize - front.offset).min((sealed_wall - front.sample) as usize);
@@ -207,7 +216,8 @@ impl AudioTimeline {
                 let paused = clock.paused_between(previous.min(start), start);
                 ensure!(
                     missing.saturating_sub(paused) <= 24_000,
-                    "{source}: audio device lost more than 500 ms of active samples. Packet=[{timing}] missing_frames={missing} paused_frames={paused}."
+                    "{source}: audio device lost more than 500 ms of active samples. current=[{timing}] previous=[{}] missing_frames={missing} paused_frames={paused}.",
+                    predecessor()
                 );
                 self.pending.front_mut().unwrap().device_gap = None;
             }
@@ -217,15 +227,15 @@ impl AudioTimeline {
             }
             let overlap = self.committed.saturating_sub(active.media);
             ensure!(overlap <= 960,
-                "{source}: active audio arrived more than 20 ms behind committed media. Capture interrupted rather than silently dropping sound. Packet=[{timing}] active_sample={} committed_sample={} overlap_frames={overlap}.",
-                active.media, self.committed);
+                "{source}: active audio arrived more than 20 ms behind committed media. Capture interrupted rather than silently dropping sound. current=[{timing}] previous=[{}] active_sample={} committed_sample={} overlap_frames={overlap}.",
+                predecessor(), active.media, self.committed);
             if overlap > 0 {
                 self.consume(overlap.min(active.frames) as usize);
                 continue;
             }
             let gap = active.media.saturating_sub(self.committed);
-            ensure!(gap <= 24_000, "{source}: active audio timestamp gap exceeded 500 ms. Packet=[{timing}] active_sample={} committed_sample={} gap_frames={gap}.",
-                active.media, self.committed);
+            ensure!(gap <= 24_000, "{source}: active audio timestamp gap exceeded 500 ms. current=[{timing}] previous=[{}] active_sample={} committed_sample={} gap_frames={gap}.",
+                predecessor(), active.media, self.committed);
             if gap > 480 {
                 return Ok(self.silence(active.media));
             }
@@ -514,6 +524,33 @@ mod tests {
                 assert_eq!(timeline.committed, 1920);
             }
         }
+    }
+
+    #[test]
+    fn deferred_error_keeps_its_packet_predecessor_after_later_packets_arrive() {
+        let mut timeline = AudioTimeline::new(false, 0);
+        let clock = PauseTimeline::default();
+        timeline.observe(packet(9600, 0, 480, 1), 100_000).unwrap();
+        drain(&mut timeline, &clock, 480);
+        let mut reset = packet(0, 28_800, 480, 2);
+        reset.timing.sequence = 2;
+        reset.timing.flags = AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32;
+        timeline.observe(reset, 6_100_000).unwrap();
+        let mut later = packet(480, 29_280, 480, 3);
+        later.timing.sequence = 3;
+        timeline.observe(later, 6_200_000).unwrap();
+        assert_eq!(timeline.last_packet.unwrap().sequence, 3);
+        let error = match timeline.prepare_next(&clock, 30_000, u64::MAX, false) {
+            Err(error) => format!("{error:#}"),
+            Ok(_) => panic!("The active timestamp gap was not rejected."),
+        };
+        assert!(error.contains("gap_frames=28320"), "{error}");
+        assert!(error.contains("sequence=2"), "{error}");
+        assert!(
+            error.contains("previous=[sequence=1 position=9600"),
+            "{error}"
+        );
+        assert!(!error.contains("sequence=3"), "{error}");
     }
 
     #[test]

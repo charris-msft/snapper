@@ -138,13 +138,77 @@ pub struct Packet {
     pub pcm: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+struct AcquiredTiming {
+    timestamp: u64,
+    device_position: u64,
+    frames: u32,
+    flags: u32,
+}
+
+struct PacketReader {
+    system: bool,
+    engine_mix_rate_hz: u32,
+    sequence: u64,
+    previous: Option<PacketTiming>,
+}
+
+impl PacketReader {
+    fn finish(
+        &mut self,
+        index: u8,
+        acquired: AcquiredTiming,
+        copy_pcm: impl FnOnce(PacketTiming) -> Result<Vec<u8>>,
+        release: impl FnOnce() -> Result<()>,
+    ) -> Result<Packet> {
+        let sequence = self.sequence.checked_add(1);
+        let previous = self.previous;
+        let result = (|| -> Result<Packet> {
+            let sequence = sequence.context("Audio packet sequence overflow")?;
+            self.sequence = sequence;
+            let timing = PacketTiming {
+                sequence,
+                timestamp: i64::try_from(acquired.timestamp)
+                    .context("Audio QPC timestamp overflow")?,
+                device_position: acquired.device_position,
+                frames: acquired.frames,
+                flags: acquired.flags,
+                client_rate_hz: PCM_SAMPLE_RATE,
+                engine_mix_rate_hz: Some(self.engine_mix_rate_hz),
+            };
+            timing.validate()?;
+            let pcm = copy_pcm(timing)?;
+            ensure!(
+                pcm.len() == timing.frames as usize * 4,
+                "Audio sample count disagrees with its bounded PCM payload."
+            );
+            Ok(Packet { timing, pcm })
+        })();
+        let released = release().context("IAudioCaptureClient::ReleaseBuffer");
+        let result = match (result, released) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(release_error)) => {
+                Err(error.context(format!("Packet release also failed: {release_error:#}")))
+            }
+        };
+        let packet = result.with_context(|| format!(
+            "{} acquisition stream index={index}: current=[sequence={} position={} frames={} qpc_100ns={} flags={:#x} client_rate_hz={} engine_mix_rate_hz={}] previous=[{}]",
+            source_label(self.system), sequence.map(|value| value.to_string()).unwrap_or_else(|| "overflow".into()),
+            acquired.device_position, acquired.frames, acquired.timestamp, acquired.flags,
+            PCM_SAMPLE_RATE, self.engine_mix_rate_hz,
+            previous.map(|packet| packet.to_string()).unwrap_or_else(|| "none".into()),
+        ))?;
+        self.previous = Some(packet.timing);
+        Ok(packet)
+    }
+}
+
 pub struct Audio {
     capture: IAudioCaptureClient,
     client: IAudioClient,
     started: bool,
-    system: bool,
-    engine_mix_rate_hz: u32,
-    sequence: u64,
+    packets: PacketReader,
     _apartment: ComApartment,
 }
 impl Audio {
@@ -207,9 +271,12 @@ impl Audio {
                 capture,
                 client,
                 started: false,
-                system,
-                engine_mix_rate_hz,
-                sequence: 0,
+                packets: PacketReader {
+                    system,
+                    engine_mix_rate_hz,
+                    sequence: 0,
+                    previous: None,
+                },
                 _apartment: apartment,
             })
         }
@@ -222,22 +289,18 @@ impl Audio {
         self.started = true;
         Ok(())
     }
-    pub fn packet(&mut self) -> Result<Option<Packet>> {
-        let sequence = self
-            .sequence
-            .checked_add(1)
-            .context("Audio packet sequence overflow")?;
-        self.read_packet(sequence).with_context(|| {
+    pub fn packet(&mut self, index: u8) -> Result<Option<Packet>> {
+        self.read_packet(index).with_context(|| {
             format!(
-                "{} acquisition: client_rate_hz={} engine_mix_rate_hz={} packet_sequence={sequence}",
-                source_label(self.system),
+                "{} acquisition stream index={index}: client_rate_hz={} engine_mix_rate_hz={}",
+                source_label(self.packets.system),
                 PCM_SAMPLE_RATE,
-                self.engine_mix_rate_hz
+                self.packets.engine_mix_rate_hz
             )
         })
     }
 
-    fn read_packet(&mut self, sequence: u64) -> Result<Option<Packet>> {
+    fn read_packet(&mut self, index: u8) -> Result<Option<Packet>> {
         // SAFETY: Acquire/copy/release stay on the owner thread; lengths are bounded before copying.
         unsafe {
             if self
@@ -265,48 +328,28 @@ impl Audio {
             if frames == 0 {
                 return Ok(None);
             }
-            self.sequence = sequence;
-            let packet_context = || {
-                format!(
-                "WASAPI packet sequence={sequence} position={position} frames={frames} qpc_100ns={timestamp} flags={flags:#x}"
-            )
-            };
-            let result = (|| -> Result<Packet> {
-                let timing = PacketTiming {
-                    sequence,
-                    timestamp: i64::try_from(timestamp).context("Audio QPC timestamp overflow")?,
-                    device_position: position,
-                    frames,
-                    flags,
-                    client_rate_hz: PCM_SAMPLE_RATE,
-                    engine_mix_rate_hz: Some(self.engine_mix_rate_hz),
-                };
-                timing.validate()?;
-                let bytes = frames as usize * 4;
-                let pcm = if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                    vec![0; bytes]
-                } else {
-                    ensure!(
-                        !ptr.is_null() || bytes == 0,
-                        "Audio source returned an invalid buffer."
-                    );
-                    std::slice::from_raw_parts(ptr, bytes).to_vec()
-                };
-                Ok(Packet { timing, pcm })
-            })()
-            .with_context(packet_context);
-            let release = self.capture.ReleaseBuffer(frames).with_context(|| {
-                format!("IAudioCaptureClient::ReleaseBuffer: {}", packet_context())
-            });
-            if let Err(error) = release {
-                return match result {
-                    Ok(_) => Err(error),
-                    Err(packet_error) => {
-                        Err(packet_error.context(format!("Packet release also failed: {error:#}")))
-                    }
-                };
-            }
-            Ok(Some(result?))
+            let capture = &self.capture;
+            self.packets
+                .finish(
+                    index,
+                    AcquiredTiming {
+                        timestamp,
+                        device_position: position,
+                        frames,
+                        flags,
+                    },
+                    |timing| {
+                        let bytes = timing.frames as usize * 4;
+                        if timing.flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                            Ok(vec![0; bytes])
+                        } else {
+                            ensure!(!ptr.is_null(), "Audio source returned an invalid buffer.");
+                            Ok(std::slice::from_raw_parts(ptr, bytes).to_vec())
+                        }
+                    },
+                    || Ok(capture.ReleaseBuffer(frames)?),
+                )
+                .map(Some)
         }
     }
     pub fn stop(&mut self) -> Result<()> {
@@ -342,6 +385,128 @@ mod tests {
             client_rate_hz: PCM_SAMPLE_RATE,
             engine_mix_rate_hz: Some(16_000),
         }
+    }
+
+    #[test]
+    fn native_packet_validation_keeps_the_acquired_pair_and_releases_rejected_buffers() {
+        use std::cell::Cell;
+        for (system, index) in [(true, 0), (false, 0), (false, 1)] {
+            for preceding in [0, 2] {
+                let mut reader = PacketReader {
+                    system,
+                    engine_mix_rate_hz: 16_000,
+                    sequence: 0,
+                    previous: None,
+                };
+                let releases = Cell::new(0);
+                for step in 0..preceding {
+                    let packet = reader
+                        .finish(
+                            index,
+                            AcquiredTiming {
+                                timestamp: step * 100_000,
+                                device_position: step * 480,
+                                frames: 480,
+                                flags: 0,
+                            },
+                            |_| Ok(vec![step as u8; 1920]),
+                            || {
+                                releases.set(releases.get() + 1);
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                    assert_eq!(packet.timing.sequence, step + 1);
+                }
+                let acquired = AcquiredTiming {
+                    timestamp: preceding * 100_000,
+                    device_position: preceding * 480,
+                    frames: 480,
+                    flags: (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0
+                        | AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0) as u32,
+                };
+                let result = reader.finish(
+                    index,
+                    acquired,
+                    |_| panic!("Invalid timestamp must fail before copying PCM."),
+                    || {
+                        releases.set(releases.get() + 1);
+                        Ok(())
+                    },
+                );
+                let error = match result {
+                    Err(error) => format!("{error:#}"),
+                    Ok(_) => panic!("An uncertain timestamp was accepted."),
+                };
+                for field in [
+                    source_label(system).to_owned(),
+                    format!("stream index={index}"),
+                    format!(
+                        "current=[sequence={} position={}",
+                        preceding + 1,
+                        preceding * 480
+                    ),
+                    "flags=0x5".into(),
+                    "client_rate_hz=48000".into(),
+                    "engine_mix_rate_hz=16000".into(),
+                    "invalid timestamp".into(),
+                ] {
+                    assert!(error.contains(&field), "{error}");
+                }
+                assert!(
+                    error.contains(if preceding == 0 {
+                        "previous=[none]"
+                    } else {
+                        "previous=[sequence=2 position=480 frames=480 qpc_100ns=100000 flags=0x0"
+                    }),
+                    "{error}"
+                );
+                assert_eq!(
+                    reader.previous.map(|header| header.sequence),
+                    (preceding != 0).then_some(preceding)
+                );
+                assert_eq!(releases.get(), preceding + 1);
+                assert!(error.len() < 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn native_packet_release_failure_keeps_the_previous_successful_header() {
+        let mut reader = PacketReader {
+            system: false,
+            engine_mix_rate_hz: 48_000,
+            sequence: 0,
+            previous: None,
+        };
+        let acquired = AcquiredTiming {
+            timestamp: 0,
+            device_position: 9600,
+            frames: 480,
+            flags: 0,
+        };
+        reader
+            .finish(1, acquired, |_| Ok(vec![1; 1920]), || Ok(()))
+            .unwrap();
+        let result = reader.finish(
+            1,
+            AcquiredTiming {
+                timestamp: 100_000,
+                device_position: 10_080,
+                ..acquired
+            },
+            |_| Ok(vec![2; 1920]),
+            || anyhow::bail!("Injected ReleaseBuffer failure"),
+        );
+        let error = match result {
+            Err(error) => format!("{error:#}"),
+            Ok(_) => panic!("Buffer release failure was hidden."),
+        };
+        assert!(error.contains("stream index=1"));
+        assert!(error.contains("current=[sequence=2 position=10080"));
+        assert!(error.contains("previous=[sequence=1 position=9600"));
+        assert!(error.contains("Injected ReleaseBuffer failure"));
+        assert_eq!(reader.previous.unwrap().sequence, 1);
     }
 
     #[test]

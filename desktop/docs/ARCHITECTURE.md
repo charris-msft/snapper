@@ -105,10 +105,17 @@ the QPC/media timeline or replacing PCM. The next unflagged packet must again
 follow the prior packet's end. Invalid timestamps, backward QPC, oversized
 packets and active-time gap/overlap budgets remain fail-closed. See Microsoft's
 [`AUDCLNT_BUFFERFLAGS` contract](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/ne-audioclient-_audclnt_bufferflags).
-Admission errors include the source role/index, previous/current packet sequence,
-positions, frame counts, QPC values, raw flags and client/engine mix rates. The
+Packet validation errors, both before queueing and during deferred timing
+admission, include the source role/index, previous/current packet sequence,
+positions, frame counts, QPC values, raw flags and client/engine mix rates. Each
+pending packet retains its own predecessor header; a later queued packet cannot
+replace that diagnostic pair. First packets explicitly report no predecessor.
+Native validation retains the last successfully released packet's header and
+still releases the acquired buffer if validation fails. The
 engine rate comes from `GetMixFormat` on the already selected client; it is not
 an inferred physical hardware rate. Diagnostics contain no PCM or images.
+The existing quiet-loopback and bounded-gap silence policies are unchanged;
+discontinuity handling and its diagnostics add no new silence fallback.
 Contract counterexamples are generated inputs, not replays of a native failure
 whose packet metadata was not recorded. Native source attribution and confirmation
 still require a separately approved run when the historical trace is absent.

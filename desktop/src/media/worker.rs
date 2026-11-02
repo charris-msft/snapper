@@ -256,7 +256,7 @@ impl Devices {
                                     !state.stop.load(Ordering::Acquire),
                                     "Microphone startup cancelled."
                                 );
-                                if native.packet()?.is_some() {
+                                if native.packet(this_index)?.is_some() {
                                     break;
                                 }
                                 ensure!(Instant::now()<deadline,"The selected microphone started but delivered no packet within 1 second.");
@@ -270,7 +270,7 @@ impl Devices {
                     {
                         if let Some(native) = native.as_mut() {
                             for _ in 0..64 {
-                                if native.packet()?.is_none() {
+                                if native.packet(this_index)?.is_none() {
                                     break;
                                 }
                             }
@@ -286,7 +286,7 @@ impl Devices {
                     let mut next_drained = Instant::now();
                     while !state.stop.load(Ordering::Acquire) {
                         if let Some(native) = native.as_mut() {
-                            while let Some(packet) = native.packet()? {
+                            while let Some(packet) = native.packet(this_index)? {
                                 last_packet = Instant::now();
                                 send_audio(
                                     &state,
@@ -562,25 +562,27 @@ fn receive_audio(devices: &Devices, timelines: &mut [AudioTimeline], state: &Sha
     Ok(())
 }
 
-fn admit_audio(
+fn write_audio_until(
     timelines: &mut [AudioTimeline],
     clock: &PauseTimeline,
     sealed_wall: u64,
     media_limit: u64,
     final_drain: bool,
-    encoder: &mut encoder::Encoder,
+    mut write: impl FnMut(u8, u64, &[u8]) -> Result<()>,
     state: &Shared,
 ) -> Result<()> {
     for (index, timeline) in timelines.iter_mut().enumerate() {
         let budget = if final_drain { usize::MAX } else { 32 };
         for _ in 0..budget {
-            let prepared = timeline.prepare_next(clock, sealed_wall, media_limit, final_drain)?;
+            let prepared = timeline
+                .prepare_next(clock, sealed_wall, media_limit, final_drain)
+                .with_context(|| format!("Preparing selected audio stream index={index}"))?;
             state
                 .audio_bytes
                 .fetch_sub(timeline.take_released_bytes(), Ordering::AcqRel);
             let Some(prepared) = prepared else { break };
             write_media(state, || {
-                encoder.audio(index as u8, prepared.sample / 48, &prepared.pcm)
+                write(index as u8, prepared.sample / 48, &prepared.pcm)
             })?;
             timeline.commit(&prepared)?;
             state
@@ -873,13 +875,13 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
                 break;
             }
             receive_audio(&devices, &mut audio_timelines, shared)?;
-            admit_audio(
+            write_audio_until(
                 &mut audio_timelines,
                 &clock,
                 wall,
                 media_limit,
                 false,
-                &mut encoder,
+                |index, ms, pcm| encoder.audio(index, ms, pcm),
                 shared,
             )?;
             let video_sample = clock.media_at(shared.wall_sample()?);
@@ -1011,13 +1013,13 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
         thread::sleep(Duration::from_secs(60));
     }
     if let Err(error) = receive_audio(&devices, &mut audio_timelines, shared).and_then(|_| {
-        admit_audio(
+        write_audio_until(
             &mut audio_timelines,
             &clock,
             final_wall,
             media_limit,
             true,
-            &mut encoder,
+            |index, ms, pcm| encoder.audio(index, ms, pcm),
             shared,
         )
     }) {
@@ -1302,6 +1304,138 @@ mod tests {
                 shared.progress.lock().unwrap().peak_audio_queue_bytes,
                 sources.len() * 5760
             );
+        }
+    }
+
+    #[test]
+    fn deferred_audio_failures_keep_the_correct_queued_pair_and_selected_index() {
+        use platform::audio::{Packet, PacketTiming};
+        use windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
+        for (case, first_frames, position, sample, discontinuity, expected) in [
+            ("timestamp-gap", 480, 0, 28_800, true, "gap_frames=28320"),
+            (
+                "device-gap",
+                480,
+                34_081,
+                480,
+                false,
+                "missing_frames=24001",
+            ),
+            ("overlap", 1920, 0, 480, true, "overlap_frames=1440"),
+            ("first-packet", 0, 0, 28_800, true, "previous=[none]"),
+        ] {
+            let shared = audio_test_state();
+            let (tx, rx) = bounded(512);
+            let devices = Devices {
+                shared: shared.clone(),
+                threads: vec![],
+                screen: Arc::new(Mutex::new(None)),
+                camera: Arc::new(Mutex::new(None)),
+                audio: rx,
+            };
+            let mut timelines = vec![AudioTimeline::new(true, 0), AudioTimeline::new(false, 0)];
+            let packet = |sequence, position, sample, frames, flags| Packet {
+                timing: PacketTiming {
+                    sequence,
+                    device_position: position,
+                    frames,
+                    flags,
+                    timestamp: (sample as i128 * 10_000_000 / i128::from(SAMPLE_RATE)) as i64,
+                    client_rate_hz: SAMPLE_RATE as u32,
+                    engine_mix_rate_hz: Some(16_000),
+                },
+                pcm: vec![sequence as u8; frames as usize * 4],
+            };
+            let mut writes = 0;
+            if first_frames != 0 {
+                send_audio(
+                    &shared,
+                    &tx,
+                    AudioEvent::Packet {
+                        index: 1,
+                        observed: 400_000,
+                        packet: packet(1, 9600, 0, first_frames, 0),
+                    },
+                )
+                .unwrap();
+                receive_audio(&devices, &mut timelines, &shared).unwrap();
+                write_audio_until(
+                    &mut timelines,
+                    &PauseTimeline::default(),
+                    u64::from(first_frames),
+                    u64::MAX,
+                    false,
+                    |index, ms, pcm| {
+                        assert_eq!((index, ms, pcm.len()), (1, 0, first_frames as usize * 4));
+                        writes += 1;
+                        Ok(())
+                    },
+                    &shared,
+                )
+                .unwrap();
+            }
+            let current_sequence = if first_frames == 0 { 1 } else { 2 };
+            for (sequence, position, sample, flags) in [
+                (
+                    current_sequence,
+                    position,
+                    sample,
+                    if discontinuity {
+                        AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32
+                    } else {
+                        0
+                    },
+                ),
+                (current_sequence + 1, position + 480, sample + 480, 0),
+            ] {
+                let queued = packet(sequence, position, sample, 480, flags);
+                let observed = queued.timing.timestamp + 100_000;
+                send_audio(
+                    &shared,
+                    &tx,
+                    AudioEvent::Packet {
+                        index: 1,
+                        observed,
+                        packet: queued,
+                    },
+                )
+                .unwrap();
+            }
+            receive_audio(&devices, &mut timelines, &shared).unwrap();
+            let error = write_audio_until(
+                &mut timelines,
+                &PauseTimeline::default(),
+                30_000,
+                u64::MAX,
+                false,
+                |_, _, _| panic!("A rejected packet must not reach the encoder."),
+                &shared,
+            )
+            .unwrap_err();
+            let error = format!("{error:#}");
+            for field in [
+                "Preparing selected audio stream index=1",
+                "Microphone",
+                expected,
+            ] {
+                assert!(error.contains(field), "{case}: {error}");
+            }
+            assert!(
+                error.contains(&format!("current=[sequence={current_sequence} ")),
+                "{error}"
+            );
+            if first_frames != 0 {
+                assert!(
+                    error.contains("previous=[sequence=1 position=9600"),
+                    "{error}"
+                );
+            }
+            assert!(
+                !error.contains(&format!("sequence={} ", current_sequence + 1)),
+                "{error}"
+            );
+            assert_eq!(writes, usize::from(first_frames != 0));
+            assert!(error.len() < 1024, "{error}");
         }
     }
 
