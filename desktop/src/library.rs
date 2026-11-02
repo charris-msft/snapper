@@ -82,6 +82,18 @@ impl StagedFile {
         self.temporary = None;
         Ok(())
     }
+
+    pub(crate) fn target(path: &Path) -> Result<Self> {
+        let (staged, file) = Self::create(path)?;
+        drop(file);
+        Ok(staged)
+    }
+
+    pub(crate) fn path(&self) -> Result<&Path> {
+        self.temporary
+            .as_deref()
+            .context("Staged output is already published")
+    }
 }
 
 impl Drop for StagedFile {
@@ -114,14 +126,31 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn copy_file_new(source: &Path, destination: &Path) -> Result<()> {
+    stage_file_copy(source, destination, || Ok(()))?.publish_new()
+}
+
+pub(crate) fn stage_file_copy(
+    source: &Path,
+    destination: &Path,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<StagedFile> {
     let mut input = File::open(source).context("Opening the saved library original")?;
     let (staged, mut output) = StagedFile::create(destination)?;
-    std::io::copy(&mut input, &mut output)
-        .context("Copying the saved capture; the library original is retained")?;
+    let mut buffer = [0; 65536];
+    loop {
+        check()?;
+        let length = input.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..length])
+            .context("Copying saved capture; library original retained")?;
+    }
     output.flush()?;
     output.sync_all()?;
     drop(output);
-    staged.publish_new()
+    Ok(staged)
 }
 
 pub fn stage_json(path: &Path, value: &impl Serialize) -> Result<StagedFile> {

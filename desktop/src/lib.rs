@@ -7,3 +7,4 @@ pub mod model;
 pub mod platform;
 pub mod render;
 pub mod transport;
+pub mod video;

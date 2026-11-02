@@ -1,4 +1,5 @@
 mod capture_ui;
+mod video_ui;
 
 use crate::{
     library::{self, Capture, CaptureKind, Library},
@@ -24,6 +25,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use video_ui::{VideoJobUi, VideoUi};
 
 const TEAL: Color32 = Color32::from_rgb(0, 128, 124);
 const INK: Color32 = Color32::from_rgb(31, 43, 61);
@@ -422,6 +424,10 @@ enum TaskResult {
     WindowGuides(Vec<WindowGuide>),
     OutputDirectory(PathBuf),
     VideoMetadataSaved(Capture),
+    VideoLoaded(Capture, crate::video::VideoDocument),
+    VideoPlanSaved(crate::video::VideoPlan),
+    VideoRendered(crate::video::EditedPreview, Option<PathBuf>),
+    VideoFrame(RgbaImage, u32, String),
     Notice(String),
 }
 struct Draft {
@@ -480,6 +486,8 @@ pub struct Editor {
     close_warning: bool,
     property_gesture: bool,
     video_metadata_dirty: bool,
+    video: Option<VideoUi>,
+    video_job: Option<VideoJobUi>,
 }
 
 fn native_icon() -> egui::IconData {
@@ -632,6 +640,8 @@ impl Editor {
             close_warning: false,
             property_gesture: false,
             video_metadata_dirty: false,
+            video: None,
+            video_job: None,
         };
         app.refresh(&cc.egui_ctx);
         Ok(app)
@@ -640,7 +650,9 @@ impl Editor {
         self.task.is_some()
     }
     fn unsaved(&self) -> bool {
-        self.generation != self.saved_generation || self.video_metadata_dirty
+        self.generation != self.saved_generation
+            || self.video_metadata_dirty
+            || self.video.as_ref().is_some_and(|video| video.dirty)
     }
     fn editable(&self) -> bool {
         self.document.is_some()
@@ -701,7 +713,18 @@ impl Editor {
             return;
         }
         let library = self.library.clone();
+        let video_control = Arc::new(crate::video::VideoControl::default());
+        if capture.kind == CaptureKind::Video {
+            self.video_job = Some(VideoJobUi {
+                control: video_control.clone(),
+            });
+        }
         self.task(ctx, move || {
+            if capture.kind == CaptureKind::Video {
+                let document =
+                    crate::video::VideoDocument::open(&library, &capture, &video_control)?;
+                return Ok(TaskResult::VideoLoaded(capture, document));
+            }
             let data = if capture.kind == CaptureKind::Image {
                 Some((
                     library::load_image(&library.capture_dir(&capture)?.join("original.png"))?,
@@ -757,6 +780,10 @@ impl Editor {
         self.queue_render();
     }
     fn undo(&mut self, redo: bool) {
+        if self.video.is_some() {
+            self.undo_video(redo);
+            return;
+        }
         if let Some(document) = &mut self.document {
             let changed = if redo {
                 self.history.redo(document)
@@ -807,6 +834,7 @@ impl Editor {
         });
         if let Some(result) = result {
             self.task = None;
+            self.video_job = None;
             match result {
                 Ok(TaskResult::Listing(captures, thumbs, recovery, warnings)) => {
                     self.captures = captures;
@@ -822,6 +850,7 @@ impl Editor {
                     }
                 }
                 Ok(TaskResult::Loaded(capture, data)) => {
+                    self.video = None;
                     self.tags = capture.tags.join(", ");
                     self.current = Some(capture);
                     self.selected = None;
@@ -860,6 +889,36 @@ impl Editor {
                     });
                     self.status = "Video title and tags saved locally.".into();
                     self.refresh_pending = true;
+                }
+                Ok(TaskResult::VideoLoaded(capture, document)) => {
+                    self.tags = capture.tags.join(", ");
+                    self.current = Some(capture);
+                    self.video = Some(VideoUi::new(document));
+                    self.original = None;
+                    self.document = None;
+                    self.flattened = None;
+                    self.texture = None;
+                    self.selected = None;
+                    self.video_metadata_dirty = false;
+                    self.page_library = false;
+                    self.show_editor(ctx);
+                    self.status = "Video ready. Edits are nondestructive; update the edited preview before playback/export.".into();
+                }
+                Ok(TaskResult::VideoPlanSaved(plan)) => {
+                    if let Some(video) = &mut self.video {
+                        video.dirty = video.plan != plan;
+                        if video.dirty {
+                            video.pending_save = true;
+                        }
+                    }
+                    self.status =
+                        "Video edit instructions saved. Original recording unchanged.".into();
+                }
+                Ok(TaskResult::VideoRendered(preview, destination)) => {
+                    self.install_video_result(ctx, preview, destination)
+                }
+                Ok(TaskResult::VideoFrame(image, frame, fingerprint)) => {
+                    self.install_video_frame(ctx, image, frame, fingerprint)
                 }
                 Ok(TaskResult::Notice(message)) => {
                     self.status = message;
@@ -1028,6 +1087,9 @@ impl Editor {
                     });
                 });
             });
+        if self.video.is_some() && !self.page_library {
+            return;
+        }
         egui::SidePanel::left("tools")
             .exact_width(146.0)
             .resizable(false)
@@ -1314,7 +1376,7 @@ impl Editor {
             }
             if self.page_library{self.library_view(ui,ctx);return;}
             if self.current.as_ref().is_some_and(|c|c.kind==CaptureKind::Video) {
-                self.video_view(ui,ctx);return;
+                egui::ScrollArea::vertical().show(ui, |ui| self.video_view(ui,ctx));return;
             }
             if self.texture.is_none() {
                 ui.vertical_centered(|ui|{
@@ -1476,54 +1538,8 @@ impl Editor {
                 Ok(TaskResult::VideoMetadataSaved(saved))
             });
         }
-        ui.heading(&capture.title);
-        if let Some(texture) = self.thumbnails.get(&capture.id) {
-            ui.add(egui::Image::new(texture).max_size(Vec2::new(640.0, 360.0)));
-        }
-        ui.label("H.264 MP4 recording. Playback opens in your Windows video player.");
-        ui.label(
-            "The annotation tools edit screenshots and imported images, not a video timeline.",
-        );
-        let path = self
-            .library
-            .capture_dir(&capture)
-            .map(|p| p.join("recording.mp4"));
-        ui.horizontal(|ui| {
-            if ui.button("Play recording").clicked() {
-                if let Err(e) = path
-                    .as_ref()
-                    .map_err(|e| anyhow::anyhow!("{e:#}"))
-                    .and_then(|p| open_path(p))
-                {
-                    self.error = Some(format!("{e:#}"));
-                }
-            }
-            if ui
-                .add_enabled(!self.busy(), egui::Button::new("Save MP4 as..."))
-                .clicked()
-            {
-                if let Ok(path) = path {
-                    self.task(ctx, move || {
-                        let Some(destination) = rfd::FileDialog::new()
-                            .add_filter("MP4", &["mp4"])
-                            .set_file_name("recording.mp4")
-                            .save_file()
-                        else {
-                            return Ok(TaskResult::Notice("Export cancelled.".into()));
-                        };
-                        ensure!(
-                            destination != path,
-                            "Choose a destination other than the library original."
-                        );
-                        std::fs::copy(&path, &destination)?;
-                        Ok(TaskResult::Notice(format!(
-                            "Recording exported to {}.",
-                            destination.display()
-                        )))
-                    });
-                }
-            }
-        });
+        ui.heading("Video edits");
+        self.focused_video_view(ui, ctx);
     }
     fn canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(image) = self.flattened.as_ref() else {
@@ -1825,9 +1841,13 @@ impl eframe::App for Editor {
         } else {
             self.header(ctx);
             self.footer(ctx);
-            self.properties(ctx);
+            if self.video.is_none() || self.page_library {
+                self.properties(ctx);
+            }
             self.central(ctx);
         }
+        self.poll_video(ctx);
+        self.video_loading_status(ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.capture_ui.flow.active() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.cancel_capture_flow(ctx);
@@ -1846,7 +1866,10 @@ impl eframe::App for Editor {
                 if let Some(recorder)=&self.recorder {
                     if ui.button("Stop recording").clicked(){recorder.stop();self.close_warning=false;}
                 }else if self.unsaved()&&self.error.is_some()&&ui.button("Close and discard unsaved changes").clicked(){
-                    self.saved_generation=self.generation;ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.saved_generation=self.generation;
+                    if let Some(video)=&mut self.video{video.dirty=false;}
+                    self.video_metadata_dirty=false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
         }

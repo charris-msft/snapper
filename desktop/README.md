@@ -11,7 +11,7 @@ tested build before treating a feature or operating envelope as verified.
 
 ## Run
 
-Open `snapper-desktop.exe` in the versioned local `dist\Snapper-0.2.0-<commit>` bundle after packaging. Keep its `tools` and
+Open `snapper-desktop.exe` in the versioned local `dist\Snapper-<version>-<commit>` bundle after packaging. Keep its `tools` and
 `licenses` folders beside it. Windows 10 version 2004 or later, SDR display output,
 and a compatible Direct3D 12 adapter or Windows WARP software renderer are required. No administrator access is
 needed. This is an unsigned local development build; do not bypass an operating
@@ -41,6 +41,13 @@ Replacement and simultaneous color swap, blur, pixelation, alpha erasing,
 horizontal/vertical/jagged cutouts, grayscale, borders, undo/redo, Quick Styles,
 Favorites, tags, recent captures, PNG/JPEG export and bitmap clipboard copy.
 Blur and pixelation are **not secure redaction**.
+
+The focused video editor preserves the source and recovery segments. Trim,
+split and remove sections on an explicit 30 fps timeline, update the accurately
+re-encoded preview, then scrub frames or play that same MP4 in the Windows
+player. Save uses the verified preview bytes; a selected clip renders its own
+sub-plan. Progress and cancellation remain available through supervised codec
+work. This is not a multitrack editor or an in-app audio playback engine.
 
 Read [the user guide](docs/USER_GUIDE.md) for controls, storage, recovery and
 limitations; [the architecture](docs/ARCHITECTURE.md) for resource and lifetime
@@ -76,6 +83,9 @@ playable recovery and confirms helper cleanup after parent death.
 `--pause-test <directory>` checks decoded pause/resume duration and A/V markers,
 Stop while paused, Stop during a stalled transition, generated-camera preview
 release and adjustable camera placement. These tests use no real private inputs.
+`--video-edit-test <directory>` checks frame-accurate one-frame cuts, delayed and
+gapped audio, exact preview/export identity, cancellation, and immutable source
+and recovery segments. Use `scripts\Verify.ps1 -Suite Video` against the package.
 Use the optimized packaged candidate for media acceptance; debug codec-helper
 startup and hash checking are not a performance baseline.
 Run diagnostics through `scripts\Verify.ps1` (`-Suite Profile`, `Encoders` or

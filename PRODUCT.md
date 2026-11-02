@@ -35,11 +35,15 @@ supplement visual selection.
 - Required image tools include arrows, text, callouts, shapes, stamps,
   contiguous fill, separate color replacement/swap, styles/favorites, cutouts,
   blur, pixelation and alpha erasure. Blur and pixelation are not secure redaction.
+- Focused video editing includes preview, trimming ends, splitting/removing
+  sections and saving a selected clip or MP4. Edits are nondestructive and
+  accurate re-encoding uses an explicit 30 fps edit/output timeline. This is
+  not a multitrack production suite.
 - Native Windows/RDP operation, per-monitor DPI, bounded media memory,
   supervised device ownership, immutable originals and recoverable publication
   are required. Software/WARP rendering must be identified truthfully.
 - Cloud sharing, accounts, OCR/AI redaction, marketplaces, scrolling capture
-  and a full video editor are not included by implication.
+  and a full multitrack video editor are not included by implication.
 
 ## Brand commitments
 

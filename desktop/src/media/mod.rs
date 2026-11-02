@@ -232,6 +232,9 @@ pub fn entry() -> Result<()> {
         Some("--pause-test") => {
             selftest::pause_tests(&PathBuf::from(args.get(1).context("Pause acceptance directory is missing")?))
         },
+        Some("--video-edit-test") => {
+            crate::video::self_test(&PathBuf::from(args.get(1).context("Video-edit acceptance directory is missing")?))
+        },
         Some("--profile-test")=>{
             let directory=args.get(1).map(PathBuf::from)
                 .unwrap_or(std::env::current_dir()?.join("artifacts").join("profile-acceptance"));

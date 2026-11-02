@@ -7,10 +7,12 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\Environment.ps1"
 $Root = (Resolve-Path "$PSScriptRoot\..").Path
+$version = [regex]::Match((Get-Content -LiteralPath "$Root\Cargo.toml" -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+if (-not $version) { throw 'Cannot identify the desktop package version.' }
 if (-not $OutputPath) {
     $revision = (& git -C $Root rev-parse --short HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the local source revision.' }
-    $OutputPath = Join-Path $Root "dist\Snapper-0.2.0-$revision"
+    $OutputPath = Join-Path $Root "dist\Snapper-$version-$revision"
 }
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath, $Root)
 Push-Location $Root
@@ -84,7 +86,7 @@ try {
         [pscustomobject]@{ file=$file; sha256=(Get-FileHash $path -Algorithm SHA256).Hash; bytes=(Get-Item $path).Length }
     }
     [pscustomobject]@{
-        version='0.2.0'; configuration=$Configuration; target='x86_64-pc-windows-gnullvm'
+        version=$version; configuration=$Configuration; target='x86_64-pc-windows-gnullvm'
         commit=(& git rev-parse HEAD); created_utc=[DateTime]::UtcNow.ToString('o'); files=$files
         clean_path_startup_verified=$true; dirty_source=$dirty
         native_window_gate='Not exercised by --devices. Require Verify-Gui.ps1 evidence for this exact executable.'

@@ -352,6 +352,36 @@ pub fn run_bounded_with_output(
     timeout: Duration,
     output: Option<fs::File>,
 ) -> Result<()> {
+    run_bounded_cancellable(
+        command,
+        timeout,
+        output,
+        &std::sync::atomic::AtomicBool::new(false),
+        || Ok(()),
+    )
+}
+
+#[derive(Debug)]
+pub struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "Video work cancelled. The original and previously saved files are unchanged.",
+        )
+    }
+}
+impl std::error::Error for Cancelled {}
+
+pub fn run_bounded_cancellable(
+    command: &mut std::process::Command,
+    timeout: Duration,
+    output: Option<fs::File>,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut tick: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(Cancelled.into());
+    }
     let tool = if command.get_program() == process::media_tool("ffmpeg")?.as_os_str() {
         "ffmpeg"
     } else if command.get_program() == process::media_tool("ffprobe")?.as_os_str() {
@@ -399,6 +429,14 @@ pub fn run_bounded_with_output(
         .write_all(b"start\n")?;
     let start = Instant::now();
     loop {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            end_codec_job(&job, &mut child)?;
+            return Err(Cancelled.into());
+        }
+        if let Err(error) = tick() {
+            end_codec_job(&job, &mut child)?;
+            return Err(error);
+        }
         if let Some(code) = child.try_wait()? {
             if job.active_processes()? > 0 {
                 job.terminate()?;
@@ -416,8 +454,7 @@ pub fn run_bounded_with_output(
             return Ok(());
         }
         if start.elapsed() > timeout {
-            job.terminate()?;
-            child.wait()?;
+            end_codec_job(&job, &mut child)?;
             bail!(
                 "Media operation exceeded {} seconds; existing captures were preserved.",
                 timeout.as_secs()
@@ -425,6 +462,20 @@ pub fn run_bounded_with_output(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn end_codec_job(job: &process::Job, child: &mut std::process::Child) -> Result<()> {
+    job.terminate()?;
+    child.wait()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while job.active_processes()? > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    ensure!(
+        job.active_processes()? == 0,
+        "Codec cancellation was requested, but owned-process release could not be confirmed."
+    );
+    Ok(())
 }
 
 pub fn codec_helper(tool: &str, encoded: &str) -> Result<()> {

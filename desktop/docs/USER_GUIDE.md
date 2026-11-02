@@ -119,10 +119,46 @@ captures by title or tag.
 writes PNG, or JPEG at quality 95 with transparent pixels composited over white.
 JPEG is lossy; it cannot preserve pixel equality with the source.
 
-For videos, **Play recording** opens the local MP4 in the configured Windows
+For videos, **Play original** opens the local MP4 in the configured Windows
 player. Titles and tags use **Save title and tags** without rewriting the MP4.
-**Save MP4 as** copies it elsewhere. Video trimming and a video-annotation
-timeline are not part of this application.
+
+## Focused video editing
+
+Open a recording from Library to inspect its original and saved edit plan.
+The edit timeline is explicitly **30 fps**: one frame is 33.333 ms. Time labels
+are rounded for display; selections use whole frames and the end is excluded.
+Variable-rate source video is normalized onto that grid without changing the
+original. This is accurate re-encoding, not a fast keyframe-rounded copy.
+
+Drag the timeline's selection handles or use **Start here** and **End here**.
+**Keep selection / trim ends** retains the selected part. **Remove selection**
+cuts a middle interval. **Split at playhead** creates a section boundary without
+changing the content. Undo/redo and **Restore full original timeline** change
+only the edit instructions. Up to 64 ordered kept sections are supported.
+
+**Update edited preview** renders the current plan in a supervised background
+job. Until it finishes, the UI labels the edited preview as unavailable or
+stale rather than showing the original as if cuts had been applied. The
+playhead scrubs decoded frames of the verified edited file. **Play edited
+preview** opens that exact local MP4 in the configured Windows player. Existing
+player windows retain their old snapshot; open the updated preview to see new
+edits. **Play original** remains a separate explicit action.
+
+**Save edited MP4** copies the same verified rendering to a new filename.
+**Save selected clip** derives a sub-plan for the chosen edited-timeline range.
+Existing destination files, including originals or aliases of them, are never
+overwritten. Video and optional audio share one presentation origin; cuts use
+exact frame/sample counts and are encoded once into H.264/AAC. Codec priming
+and final AAC padding are verified separately from the video-frame timeline.
+
+Progress reports preparation, encoding, verification and final publication.
+Cancel stops the owned codec job; a short final publication already in progress
+reports that cancellation is too late rather than pretending no file was saved.
+The original recording and committed recovery segments remain unchanged.
+Preview files are derived, local cache data, limited to three renders per video.
+Close old player windows if they hold a cache file open.
+
+There is no multitrack production timeline, caption/AI pipeline or cloud sharing.
 
 Preflight's **After capture** choice routes a screenshot directly to the editor,
 bitmap clipboard or a chosen local folder. Video routes to the library view or
@@ -135,7 +171,8 @@ without discarding that original.
 
 The default library is `%LOCALAPPDATA%\Snapper\Library`. Each image has
 an immutable `original.png`, a versioned editable document, a thumbnail and
-capture metadata. Tags/Quick Styles are local JSON. There is no external upload.
+capture metadata. Tags/Quick Styles and nondestructive `video-edits.json` plans
+are local JSON. There is no external upload.
 The prior application's library is not moved or copied automatically. Use
 `--data-dir <absolute directory>` to deliberately open another local library.
 

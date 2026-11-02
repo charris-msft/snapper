@@ -125,6 +125,32 @@ queue, no B frames, a finite muxing queue and a one-second mux-interleave bound.
 Third-party encoder internals and graphics-driver allocations are not claimed
 to have a hard process-memory ceiling.
 
+## Focused video editing
+
+The video editor stores ordered kept sections in `video-edits.json`, bound to
+the source SHA-256 and an explicit 30 fps timeline. The source is held against
+writes/deletion while open. Its MP4 and committed recovery segments are never
+rewritten by editing. A maximum of 64 sections bounds the filter graph and
+command transport.
+
+Both streams are translated by the same container presentation origin. Video
+is normalized onto the declared frame grid; timestamp-aware audio resampling
+constructs continuous 48 kHz PCM, preserving delayed onset and gaps. Each cut
+uses frame indices and exactly 1,600 audio samples per video frame. After
+concatenation, video PTS are rebuilt from frame index and audio PTS from sample
+index, including video-only one-frame sections. One accurate H.264/AAC encode
+follows; there is no keyframe-copy approximation. Validation checks decoded
+frame count/PTS, effective audio sample count, dimensions and duration.
+
+Rendering uses the existing pinned, gated, Job-owned codec helper with
+cancellation and bounded progress polling. No entire uncompressed recording
+is staged. Preview caches use immutable names and content receipts; a
+deny-write/delete handle pins the bytes across preview reads and export.
+Export copies and hashes those same bytes before a cancellation/publication
+CAS admits the atomic new-file rename. The cache is bounded to three renders.
+Scrubbing decodes frames from the actual rendered edit; Windows-player
+playback opens that same file. An outdated preview is disabled explicitly.
+
 ## Stop and recovery
 
 The UI acknowledges Stop locally and sets an atomic signal. The supervisor sends

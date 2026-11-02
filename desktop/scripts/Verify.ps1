@@ -3,7 +3,7 @@
 param(
     [Parameter(Mandatory)][string]$PackagePath,
     [string]$EvidencePath = 'artifacts\portable-acceptance',
-    [ValidateSet('All','Media','Faults','Capture','Profile','Encoders','Native')][string]$Suite = 'All',
+    [ValidateSet('All','Media','Faults','Capture','Video','Profile','Encoders','Native')][string]$Suite = 'All',
     [ValidateRange(12,600)][int]$ProfileSeconds = 12,
     [string]$RequestPath,
     [switch]$ApproveScreenCapture
@@ -19,11 +19,12 @@ if ($Suite -eq 'Native') {
 $PackagePath = [IO.Path]::GetFullPath($PackagePath, $Root)
 $EvidencePath = [IO.Path]::GetFullPath($EvidencePath, $Root)
 New-Item -ItemType Directory -Force $EvidencePath | Out-Null
-$names = if ($Suite -eq 'All') { @('Media','Faults','Capture') } else { @($Suite) }
+$names = if ($Suite -eq 'All') { @('Media','Faults','Capture','Video') } else { @($Suite) }
 foreach ($name in $names) {
     $directory = Join-Path $EvidencePath $name.ToLowerInvariant()
     $option = switch ($name) {
         'Media' { '--self-test' } 'Faults' { '--fault-test' } 'Capture' { '--pause-test' }
+        'Video' { '--video-edit-test' }
         'Profile' { '--profile-test' } 'Encoders' { '--encoder-diagnostics' } 'Native' { '--native-profile' }
     }
     $info = [Diagnostics.ProcessStartInfo]::new()
