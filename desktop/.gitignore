@@ -1,0 +1,14 @@
+/target/
+/dist/
+/artifacts/
+/captures/
+/recordings/
+/logs/
+/.vs/
+*.dmp
+*.etl
+Thumbs.db
+.env
+.env.local
+/.tools/
+*.partial

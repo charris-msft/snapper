@@ -4,6 +4,21 @@ A fast Windows screenshot CLI for AI agents. Captures screens and windows via Wi
 
 **3.5 MB binary** · **~125ms single monitor** · **Zero dependencies**
 
+## Native desktop integration
+
+The Rust capture/recording/editor application is being integrated locally in
+`desktop`, separately from the Go CLI in `go`. The CLI defaults, arguments,
+JSON output and exit codes are unchanged. Desktop runtime dependencies are
+not required for the CLI. See [source provenance and boundaries](desktop/docs/IMPORT.md).
+
+This local integration is not a published desktop release. Do not use the
+root build script to build the desktop application: it replaces the installed
+CLI in `C:\tools\localbin`.
+
+Non-capturing CLI contract tests run with `cd go; go test ./...`. The tests
+compile the production parser, routing, encoding and output against synthetic
+Win32 boundary fixtures; they never capture the real desktop.
+
 ## Install
 
 Download `snapper.exe` from [Releases](https://github.com/charris-msft/snapper/releases) or build from source:
