@@ -127,6 +127,15 @@ to have a hard process-memory ceiling.
 
 ## Focused video editing
 
+Explicit playback retains the source/preview snapshot while a single background
+STA worker requests the MP4 through `ShellExecuteExW`. The configured file
+association is preserved, shell failures are returned to the UI, and success
+means only that Windows accepted the request. The app does not force foreground,
+wait for the player to exit, or claim visible playback. The worker waits for the
+shell handoff before releasing its COM apartment; Windows security prompts are
+not suppressed. Manual title/tag saves track their own admitted task separately
+from dirty metadata, including failed saves and edits made during an older save.
+
 An admitted document switch freezes outgoing controller mutations before its
 asynchronous load begins. The gate covers library opens, image imports and
 clipboard imports, keyboard/history actions, metadata, canvas/inspector edits

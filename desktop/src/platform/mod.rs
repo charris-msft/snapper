@@ -8,7 +8,10 @@ pub mod selection;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use windows::Win32::System::{
-    Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
+    Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        COINIT_MULTITHREADED,
+    },
     Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
 };
 
@@ -18,6 +21,13 @@ impl ComApartment {
         // SAFETY: Each device-owning thread establishes and releases its own MTA.
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+        }
+        Ok(Self)
+    }
+    pub fn sta() -> Result<Self> {
+        // SAFETY: The shell-handoff worker owns this STA until its synchronous request returns.
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).ok()?;
         }
         Ok(Self)
     }

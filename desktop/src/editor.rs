@@ -424,6 +424,7 @@ enum TaskResult {
     WindowGuides(Vec<WindowGuide>),
     OutputDirectory(PathBuf),
     VideoMetadataSaved(Capture),
+    PlaybackCompleted(std::result::Result<String, String>),
     VideoLoaded(Capture, crate::video::VideoDocument),
     VideoPlanSaved(crate::video::VideoPlan),
     VideoRendered(crate::video::EditedPreview, Option<PathBuf>),
@@ -486,6 +487,7 @@ pub struct Editor {
     close_warning: bool,
     property_gesture: bool,
     video_metadata_dirty: bool,
+    video_metadata_saving: bool,
     video: Option<VideoUi>,
     video_job: Option<VideoJobUi>,
     switching_capture: bool,
@@ -659,6 +661,7 @@ impl Editor {
             close_warning: false,
             property_gesture: false,
             video_metadata_dirty: false,
+            video_metadata_saving: false,
             video: None,
             video_job: None,
             switching_capture: false,
@@ -673,6 +676,15 @@ impl Editor {
         self.generation != self.saved_generation
             || self.video_metadata_dirty
             || self.video.as_ref().is_some_and(|video| video.dirty)
+    }
+    fn save_status(&self) -> (&'static str, bool) {
+        if self.video_metadata_dirty && !self.video_metadata_saving {
+            ("Unsaved metadata", false)
+        } else if self.unsaved() {
+            ("Saving...", true)
+        } else {
+            ("Local", false)
+        }
     }
     fn editable(&self) -> bool {
         self.document.is_some() && !self.switching_capture
@@ -908,6 +920,8 @@ impl Editor {
             };
             self.task = None;
             self.video_job = None;
+            let metadata_save_finished = self.video_metadata_saving;
+            self.video_metadata_saving = false;
             match result {
                 Ok(TaskResult::Listing(captures, thumbs, recovery, warnings)) => {
                     self.captures = captures;
@@ -960,8 +974,23 @@ impl Editor {
                         current.id == saved.id
                             && (current.title != saved.title || current.tags != saved.tags)
                     });
-                    self.status = "Video title and tags saved locally.".into();
+                    self.status = if self.video_metadata_dirty {
+                        "Earlier title and tags saved. Newer metadata is still unsaved.".into()
+                    } else {
+                        "Video title and tags saved locally.".into()
+                    };
                     self.refresh_pending = true;
+                }
+                Ok(TaskResult::PlaybackCompleted(result)) => {
+                    match result {
+                        Ok(filename) => self.status = format!(
+                            "Windows accepted the playback request for {filename}. Playback is not confirmed. If no player is visible, switch to your configured Windows player; it may already be open in the background."
+                        ),
+                        Err(error) => {
+                            self.status = "Playback handoff failed. No playback was confirmed; see Action needed.".into();
+                            self.error = Some(error);
+                        }
+                    }
                 }
                 Ok(TaskResult::VideoLoaded(capture, document)) => {
                     self.tags = capture.tags.join(", ");
@@ -999,7 +1028,9 @@ impl Editor {
                 }
                 Err(error) => {
                     self.error = Some(error);
-                    if self.switching_capture {
+                    if metadata_save_finished {
+                        self.status = "Title and tags were not saved. Your unsaved metadata is retained; resolve the error and save again.".into();
+                    } else if self.switching_capture {
                         self.status =
                             "The previous capture is unchanged and available for editing.".into();
                     }
@@ -1391,11 +1422,14 @@ impl Editor {
                 if let Some(image) = &self.flattened {
                     ui.label(format!("{} x {} px", image.width(), image.height()));
                 }
-                if self.unsaved() {
-                    ui.spinner();
-                    ui.label("Saving...");
-                } else {
+                let (save_status, saving) = self.save_status();
+                if !self.unsaved() {
                     ui.label(RichText::new("Local").color(TEAL));
+                } else {
+                    if saving {
+                        ui.spinner();
+                    }
+                    ui.label(save_status);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Effects / Properties").clicked() {
@@ -1636,9 +1670,6 @@ impl Editor {
                 self.error = Some(format!("{error:#}"));
             }
         }
-        let Some(capture) = self.current.clone() else {
-            return;
-        };
         if ui
             .add_enabled(
                 self.video_metadata_dirty && !self.busy(),
@@ -1646,15 +1677,34 @@ impl Editor {
             )
             .clicked()
         {
-            let library = self.library.clone();
-            let saved = capture.clone();
-            self.task(ctx, move || {
-                library.save_capture(&saved)?;
-                Ok(TaskResult::VideoMetadataSaved(saved))
-            });
+            self.save_video_metadata(ctx);
         }
         ui.heading("Video edits");
         self.focused_video_view(ui, ctx);
+    }
+    fn save_video_metadata(&mut self, ctx: &egui::Context) {
+        if !self.document_edits_allowed() || !self.video_metadata_dirty {
+            return;
+        }
+        if self.busy() {
+            self.status = "Finish the current operation before saving title and tags.".into();
+            return;
+        }
+        let Some(saved) = self
+            .current
+            .clone()
+            .filter(|capture| capture.kind == CaptureKind::Video)
+        else {
+            self.error = Some("Open a recording before saving video title and tags.".into());
+            return;
+        };
+        let library = self.library.clone();
+        self.video_metadata_saving = true;
+        self.status = "Saving video title and tags...".into();
+        self.task(ctx, move || {
+            library.save_capture(&saved)?;
+            Ok(TaskResult::VideoMetadataSaved(saved))
+        });
     }
     fn canvas(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(image) = self.flattened.as_ref() else {
@@ -2413,15 +2463,6 @@ fn texture(ctx: &egui::Context, name: &str, image: &RgbaImage) -> TextureHandle 
         egui::TextureOptions::LINEAR,
     )
 }
-fn open_path(path: &Path) -> Result<()> {
-    ensure!(path.exists(), "The selected local file no longer exists.");
-    std::process::Command::new("explorer.exe")
-        .arg(path)
-        .spawn()
-        .context("Opening the local file in Windows")?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2436,6 +2477,148 @@ mod tests {
             app.generation, app.saved_generation,
             "Image edits did not finish saving."
         );
+    }
+
+    #[test]
+    fn acceptance_followup_metadata_status_tracks_only_its_actual_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path().to_owned()).unwrap();
+        let (capture, document) =
+            crate::video::VideoDocument::controller_fixture(&library, "metadata-fixture").unwrap();
+        let ctx = egui::Context::default();
+        let lock = library::exclusive_lock(&library.root.join("application.lock")).unwrap();
+        let mut app = Editor::assemble(
+            &ctx,
+            library.clone(),
+            lock,
+            CaptureUi::controller_fixture(),
+            0,
+            "headless controller fixture".into(),
+        )
+        .unwrap();
+        complete_controller_work(&mut app, &ctx);
+        app.current = Some(capture.clone());
+        app.video = Some(VideoUi::new(document));
+        assert_eq!(app.save_status(), ("Local", false));
+        app.set_capture_metadata("First title".into(), "first".into())
+            .unwrap();
+        assert_eq!(app.save_status(), ("Unsaved metadata", false));
+        app.task(&ctx, || {
+            Ok(TaskResult::Notice("Unrelated operation finished.".into()))
+        });
+        app.save_video_metadata(&ctx);
+        assert_eq!(
+            app.save_status(),
+            ("Unsaved metadata", false),
+            "An unrelated task must not be reported as a metadata save."
+        );
+        complete_controller_work(&mut app, &ctx);
+
+        app.save_video_metadata(&ctx);
+        assert_eq!(app.save_status(), ("Saving...", true));
+        app.set_capture_metadata("Newer title".into(), "newer".into())
+            .unwrap();
+        complete_controller_work(&mut app, &ctx);
+        assert_eq!(app.save_status(), ("Unsaved metadata", false));
+        assert!(app.status.contains("Newer metadata is still unsaved"));
+        let path = library.capture_dir(&capture).unwrap().join("capture.json");
+        let saved: Capture = library::read_json(&path).unwrap();
+        assert_eq!(
+            saved.title, "First title",
+            "The save must retain its admitted snapshot."
+        );
+        app.save_video_metadata(&ctx);
+        assert_eq!(app.save_status(), ("Saving...", true));
+        complete_controller_work(&mut app, &ctx);
+        assert_eq!(app.save_status(), ("Local", false));
+        let saved: Capture = library::read_json(&path).unwrap();
+        assert_eq!(saved.title, "Newer title");
+
+        let blocked_destination = library::exclusive_lock(&path).unwrap();
+        app.set_capture_metadata("Not saved".into(), "pending".into())
+            .unwrap();
+        app.save_video_metadata(&ctx);
+        assert_eq!(app.save_status(), ("Saving...", true));
+        complete_controller_work(&mut app, &ctx);
+        assert_eq!(app.save_status(), ("Unsaved metadata", false));
+        assert!(app.error.is_some(), "The failed save must be visible.");
+        assert!(app.status.contains("were not saved"));
+        drop(blocked_destination);
+        let saved: Capture = library::read_json(&path).unwrap();
+        assert_eq!(
+            saved.title, "Newer title",
+            "Failed save must retain the previous metadata."
+        );
+    }
+
+    #[test]
+    fn acceptance_followup_playback_reports_shell_result_not_visible_playback() {
+        use super::video_ui::VideoPlayback;
+        for accepted in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let library = Library::open(directory.path().to_owned()).unwrap();
+            let (capture, document) =
+                crate::video::VideoDocument::controller_fixture(&library, "playback-fixture")
+                    .unwrap();
+            let expected_path = document.source.clone();
+            let ctx = egui::Context::default();
+            let lock = library::exclusive_lock(&library.root.join("application.lock")).unwrap();
+            let mut app = Editor::assemble(
+                &ctx,
+                library,
+                lock,
+                CaptureUi::controller_fixture(),
+                0,
+                "headless controller fixture".into(),
+            )
+            .unwrap();
+            complete_controller_work(&mut app, &ctx);
+            app.current = Some(capture);
+            let (entered, ready) = mpsc::sync_channel(1);
+            let (release, held) = mpsc::sync_channel(1);
+            app.play_video_with(
+                &ctx,
+                VideoPlayback::Original(document),
+                move |path, owner| {
+                    assert_eq!(path, expected_path);
+                    assert_eq!(owner, 0);
+                    entered.send(()).unwrap();
+                    held.recv_timeout(Duration::from_secs(5)).unwrap();
+                    if !accepted {
+                        anyhow::bail!("Injected Windows file-association rejection");
+                    }
+                    Ok(())
+                },
+            );
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(app.status.starts_with("Requesting playback"));
+            let source = app
+                .library
+                .capture_dir(app.current.as_ref().unwrap())
+                .unwrap()
+                .join("recording.mp4");
+            assert!(
+                std::fs::write(&source, b"must remain read-locked").is_err(),
+                "The playback snapshot must stay pinned throughout the shell handoff."
+            );
+            release.send(()).unwrap();
+            complete_controller_work(&mut app, &ctx);
+            if accepted {
+                assert!(app
+                    .status
+                    .contains("Windows accepted the playback request for recording.mp4"));
+                assert!(app.status.contains("Playback is not confirmed"));
+                assert!(app.status.contains("background"));
+                assert!(app.error.is_none());
+            } else {
+                assert!(app.status.starts_with("Playback handoff failed"));
+                assert!(app
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("file-association rejection"));
+            }
+        }
     }
 
     #[test]
@@ -2506,6 +2689,11 @@ mod tests {
             app.render_video(&ctx, false, false);
             app.render_video(&ctx, true, false);
             app.render_video(&ctx, true, true);
+            app.play_video_with(
+                &ctx,
+                video_ui::VideoPlayback::Original(app.video.as_ref().unwrap().document.clone()),
+                |_, _| panic!("A capture switch must not admit a player request."),
+            );
             app.poll_video(&ctx);
             assert!(
                 Arc::ptr_eq(&load_owner, &app.video_job.as_ref().unwrap().control),

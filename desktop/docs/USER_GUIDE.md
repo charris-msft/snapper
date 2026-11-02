@@ -119,8 +119,14 @@ captures by title or tag.
 writes PNG, or JPEG at quality 95 with transparent pixels composited over white.
 JPEG is lossy; it cannot preserve pixel equality with the source.
 
-For videos, **Play original** opens the local MP4 in the configured Windows
-player. Titles and tags use **Save title and tags** without rewriting the MP4.
+For videos, **Play original** requests the local MP4 in the configured Windows
+player. Snapper reports whether Windows accepted the request, not whether the
+player is visible or playing. Windows may reuse a background player window;
+switch to that player if it does not appear. A shell-open failure is reported
+in Snapper without changing your file association.
+Titles and tags show **Unsaved metadata** until **Save title and tags** starts
+the save. **Saving...** appears while that save is pending. This does not rewrite
+the MP4.
 
 ## Focused video editing
 
@@ -144,7 +150,7 @@ only the edit instructions. Up to 64 ordered kept sections are supported.
 job. Until it finishes, the UI labels the edited preview as unavailable or
 stale rather than showing the original as if cuts had been applied. The
 playhead scrubs decoded frames of the verified edited file. **Play edited
-preview** opens that exact local MP4 in the configured Windows player. Existing
+preview** requests that exact local MP4 in the configured Windows player. Existing
 player windows retain their old snapshot; open the updated preview to see new
 edits. **Play original** remains a separate explicit action.
 

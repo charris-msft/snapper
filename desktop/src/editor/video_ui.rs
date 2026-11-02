@@ -8,6 +8,19 @@ pub(super) enum VideoEditCommand {
     Restore,
 }
 
+pub(super) enum VideoPlayback {
+    Original(VideoDocument),
+    Edited(EditedPreview),
+}
+impl VideoPlayback {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Original(document) => &document.source,
+            Self::Edited(preview) => &preview.path,
+        }
+    }
+}
+
 pub(super) struct VideoUi {
     pub(super) document: VideoDocument,
     pub(super) plan: VideoPlan,
@@ -89,6 +102,41 @@ impl Drop for VideoJobUi {
 }
 
 impl Editor {
+    fn play_video(&mut self, ctx: &egui::Context, playback: VideoPlayback) {
+        self.play_video_with(ctx, playback, platform::process::open_local_video);
+    }
+
+    pub(super) fn play_video_with(
+        &mut self,
+        ctx: &egui::Context,
+        playback: VideoPlayback,
+        open: impl FnOnce(&Path, isize) -> Result<()> + Send + 'static,
+    ) {
+        if !self.document_edits_allowed() {
+            return;
+        }
+        if self.busy() {
+            self.status = "Finish the current operation before requesting playback.".into();
+            return;
+        }
+        let owner = self.window_handle;
+        self.status = "Requesting playback in your configured Windows player...".into();
+        self.task(ctx, move || {
+            let result = (|| -> Result<String> {
+                let filename = playback
+                    .path()
+                    .file_name()
+                    .context("Video filename is unavailable")?
+                    .to_string_lossy()
+                    .into_owned();
+                open(playback.path(), owner).context("Opening local video playback")?;
+                Ok(filename)
+            })()
+            .map_err(|error| format!("{error:#}"));
+            Ok(TaskResult::PlaybackCompleted(result))
+        });
+    }
+
     pub(super) fn video_loading_status(&mut self, ctx: &egui::Context) {
         if !self.switching_capture {
             return;
@@ -360,7 +408,10 @@ impl Editor {
             {
                 action = 4;
             }
-            if ui.button("Play original").clicked() {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Play original"))
+                .clicked()
+            {
                 action = 5;
             }
         });
@@ -496,8 +547,8 @@ impl Editor {
             );
         });
         let playback = match action {
-            2 if proposed.is_none() => video.preview.as_ref().map(|preview| preview.path.clone()),
-            5 => Some(video.document.source.clone()),
+            2 if proposed.is_none() => video.preview.clone().map(VideoPlayback::Edited),
+            5 => Some(VideoPlayback::Original(video.document.clone())),
             _ => None,
         };
         if cancel_requested {
@@ -509,10 +560,8 @@ impl Editor {
                 return;
             }
         }
-        if let Some(path) = playback {
-            if let Err(error) = open_path(&path) {
-                self.error = Some(format!("Opening local video playback: {error:#}"));
-            }
+        if let Some(playback) = playback {
+            self.play_video(ctx, playback);
         }
         match action {
             1 => self.render_video(ctx, false, false),

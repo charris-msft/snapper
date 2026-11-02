@@ -14,9 +14,58 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use windows::{
-    core::{HSTRING, PCWSTR},
-    Win32::{Foundation::HANDLE, Storage::FileSystem::GetDiskFreeSpaceExW, System::JobObjects::*},
+    core::{w, HSTRING, PCWSTR},
+    Win32::{
+        Foundation::{HANDLE, HWND},
+        Storage::FileSystem::GetDiskFreeSpaceExW,
+        System::JobObjects::*,
+        UI::{
+            Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW},
+            WindowsAndMessaging::SW_SHOWNORMAL,
+        },
+    },
 };
+
+pub fn open_local_video(path: &Path, owner: isize) -> Result<()> {
+    open_local_video_with(path, owner, |request| {
+        // SAFETY: The helper retains the UTF-16 file/verb strings and owning STA through this call.
+        unsafe { ShellExecuteExW(request) }?;
+        Ok(())
+    })
+}
+
+fn open_local_video_with(
+    path: &Path,
+    owner: isize,
+    open: impl FnOnce(&mut SHELLEXECUTEINFOW) -> Result<()>,
+) -> Result<()> {
+    let path = std::path::absolute(path).context("Resolving the local video playback path")?;
+    ensure!(
+        path.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4")),
+        "Playback requires a local MP4. No player was requested."
+    );
+    let metadata = std::fs::metadata(&path)
+        .context("Checking the playback file failed. No player was requested.")?;
+    ensure!(
+        metadata.is_file(),
+        "Playback requires a file, not a directory. No player was requested."
+    );
+    let _apartment = super::ComApartment::sta().context("Preparing Windows playback handoff")?;
+    let file = HSTRING::from(path.as_os_str());
+    let mut request = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        hwnd: HWND(owner as *mut _),
+        lpVerb: w!("open"),
+        lpFile: PCWSTR(file.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    open(&mut request).context(
+        "Windows could not accept the playback request. Playback is not confirmed; open the MP4 from File Explorer or check its configured player",
+    )
+}
 
 pub fn command(exe: &Path) -> Command {
     let mut command = Command::new(exe);
@@ -407,6 +456,72 @@ impl ProcessExit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn acceptance_followup_shell_open_preserves_default_handler_and_reports_errors() {
+        use windows::Win32::System::Com::{
+            CoGetApartmentType, APTTYPE, APTTYPEQUALIFIER, APTTYPE_MAINSTA, APTTYPE_STA,
+        };
+        std::thread::spawn(|| {
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("local preview with spaces.mp4");
+            std::fs::write(
+                &path,
+                b"shell-boundary fixture, never passed to Windows playback",
+            )
+            .unwrap();
+            let expected_path = path.to_string_lossy().into_owned();
+            open_local_video_with(&path, 123, |request| {
+                assert_eq!(request.cbSize, size_of::<SHELLEXECUTEINFOW>() as u32);
+                assert_eq!(request.fMask, SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI);
+                assert_eq!(request.hwnd, HWND(123 as *mut _));
+                assert_eq!(request.nShow, SW_SHOWNORMAL.0);
+                assert!(request.lpParameters.is_null());
+                assert!(request.lpClass.is_null());
+                assert!(request.hProcess.is_invalid());
+                let mut apartment = APTTYPE::default();
+                let mut qualifier = APTTYPEQUALIFIER::default();
+                // SAFETY: The request borrows the helper's live UTF-16 buffers; COM outputs are local.
+                unsafe {
+                    assert_eq!(request.lpFile.to_string().unwrap(), expected_path);
+                    assert_eq!(request.lpVerb.to_string().unwrap(), "open");
+                    CoGetApartmentType(&mut apartment, &mut qualifier).unwrap();
+                }
+                assert!(apartment == APTTYPE_STA || apartment == APTTYPE_MAINSTA);
+                Ok(())
+            })
+            .unwrap();
+            let error = open_local_video_with(&path, 0, |_| {
+                Err(
+                    windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(1155))
+                        .into(),
+                )
+            })
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("Windows could not accept the playback request"));
+            assert_eq!(
+                error.downcast_ref::<windows::core::Error>().unwrap().code(),
+                windows::core::HRESULT::from_win32(1155)
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn acceptance_followup_shell_open_rejects_missing_or_nonvideo_before_handoff() {
+        let temporary = tempfile::tempdir().unwrap();
+        for filename in ["missing.mp4", "not-video.exe"] {
+            let path = temporary.path().join(filename);
+            if filename.ends_with(".exe") {
+                std::fs::write(&path, b"not executable").unwrap();
+            }
+            let error =
+                open_local_video_with(&path, 0, |_| panic!("Invalid media reached the shell."))
+                    .unwrap_err();
+            assert!(error.to_string().contains("No player was requested"));
+        }
+    }
+
     #[test]
     fn modified_codec_is_rejected_without_execution() {
         let temporary = tempfile::tempdir().unwrap();
