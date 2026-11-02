@@ -248,6 +248,21 @@ struct State {
     terminal: bool,
     label: HWND,
     confirm: HWND,
+    font: HFONT,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if !self.font.is_invalid() {
+            // SAFETY: All child controls are destroyed before this owning-thread font is released.
+            if !unsafe { DeleteObject(self.font) }.as_bool() {
+                eprintln!(
+                    "Region selector font release failed: {}",
+                    windows::core::Error::from_win32()
+                );
+            }
+        }
+    }
 }
 
 const ACCEPT: usize = 101;
@@ -280,6 +295,7 @@ impl Overlay {
                 terminal: false,
                 label: HWND::default(),
                 confirm: HWND::default(),
+                font: HFONT::default(),
             };
             let outcome = run_overlay(&mut state, &live, &cancelled, &ready);
             if let Err(error) = outcome {
@@ -383,6 +399,21 @@ fn run_overlay(
             SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)?;
             let scale = state.monitor.dpi as i32;
             let unit = |value: i32| value * scale / 96;
+            let mut font = LOGFONTW {
+                lfHeight: -unit(16),
+                lfWeight: FW_NORMAL.0 as i32,
+                lfCharSet: DEFAULT_CHARSET,
+                lfQuality: CLEARTYPE_QUALITY,
+                ..Default::default()
+            };
+            for (slot, unit) in font.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
+                *slot = unit;
+            }
+            state.font = CreateFontIndirectW(&font);
+            ensure!(
+                !state.font.is_invalid(),
+                "The region selector's DPI-scaled control font could not be created."
+            );
             let x = (state.monitor.width as i32 - unit(640)).max(0) / 2;
             state.label = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -412,7 +443,7 @@ fn run_overlay(
                 instance,
                 None,
             )?;
-            CreateWindowExW(
+            let cancel = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 w!("BUTTON"),
                 w!("Cancel (Esc)"),
@@ -426,6 +457,14 @@ fn run_overlay(
                 instance,
                 None,
             )?;
+            for control in [state.label, state.confirm, cancel] {
+                SendMessageW(
+                    control,
+                    WM_SETFONT,
+                    WPARAM(state.font.0 as usize),
+                    LPARAM(1),
+                );
+            }
             update_label(state)?;
             ensure!(
                 !closing.load(Ordering::Acquire),

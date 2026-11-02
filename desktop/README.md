@@ -46,6 +46,8 @@ Read [the user guide](docs/USER_GUIDE.md) for controls, storage, recovery and
 limitations; [the architecture](docs/ARCHITECTURE.md) for resource and lifetime
 contracts; and [dependency provenance](docs/DEPENDENCIES.md) for licenses and
 upstream references.
+The [measurement guide](docs/MEASUREMENT.md) separates consent-gated native
+recording metrics, generated A/V acceptance and encoder-availability probes.
 
 ## Build and verify
 
@@ -91,6 +93,10 @@ content, verify its rendered framebuffer, and save the actual adapter/hash
 report plus a PNG. It does not activate any screen, camera or audio capture.
 
 `--devices` enumerates displays/cameras without opening a capture stream.
+`--encoder-diagnostics <directory>` probes named encoders using generated
+frames, without changing the production software encoder.
+`--native-profile <request.json> <directory> --approve-screen-capture` is an
+explicitly approved real-screen measurement, not an unattended setup step.
 `--data-dir <absolute directory>` selects a separate local library.
 `--recover <session directory>` validates and exports an interrupted session.
 

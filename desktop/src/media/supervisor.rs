@@ -185,6 +185,8 @@ fn publish_progress(
     let mut current = state.lock().unwrap_or_else(|e| e.into_inner());
     // Stop acknowledgement and heartbeat publication share this linearization point.
     let mut incoming = merge_progress(incoming, stop.load(Ordering::Acquire));
+    incoming.peak_job_committed_bytes = current.peak_job_committed_bytes;
+    incoming.worker_cpu_100ns = current.worker_cpu_100ns;
     let requested = control.load(Ordering::Acquire);
     if incoming.control_ack < requested >> 1 && active_phase(incoming.phase) {
         incoming.phase = if requested & 1 != 0 {
@@ -202,11 +204,13 @@ fn persist_exit_progress(
     state: &Mutex<Progress>,
     stop: &AtomicBool,
     peak_memory: usize,
+    worker_cpu: u64,
     path: &std::path::Path,
     before_persist: impl FnOnce(),
 ) -> Result<Progress> {
     let mut current = state.lock().unwrap_or_else(|e| e.into_inner());
     current.peak_job_committed_bytes = peak_memory;
+    current.worker_cpu_100ns = worker_cpu;
     before_persist();
     // Stop, the exit snapshot and its durable publication share one boundary.
     // Never copy an earlier heartbeat back over an acknowledged Stop.
@@ -336,9 +340,11 @@ fn supervise(
     let mut pending_control = None;
     loop {
         peak_memory = peak_memory.max(job.peak_committed_bytes()?);
+        let worker_cpu = job.cpu_100ns()?;
         {
             let mut p = progress.lock().unwrap_or_else(|e| e.into_inner());
             p.peak_job_committed_bytes = peak_memory;
+            p.worker_cpu_100ns = worker_cpu;
         }
         if let Some(code) = child.try_wait()? {
             if job.active_processes()? > 0 {
@@ -359,6 +365,7 @@ fn supervise(
                 progress,
                 stop,
                 peak_memory,
+                job.cpu_100ns()?,
                 &request.session_dir.join("last-progress.json"),
                 || {},
             )?;
@@ -473,6 +480,26 @@ fn supervise(
 mod tests {
     use super::*;
     #[test]
+    fn worker_heartbeats_do_not_reset_parent_owned_family_measurements() {
+        let state = Mutex::new(Progress {
+            worker_cpu_100ns: 12345,
+            peak_job_committed_bytes: 67890,
+            ..Default::default()
+        });
+        publish_progress(
+            &state,
+            &AtomicBool::new(false),
+            &AtomicU64::new(0),
+            Progress {
+                phase: Phase::Recording,
+                ..Default::default()
+            },
+        );
+        let current = state.lock().unwrap();
+        assert_eq!(current.worker_cpu_100ns, 12345);
+        assert_eq!(current.peak_job_committed_bytes, 67890);
+    }
+    #[test]
     fn delayed_heartbeats_cannot_acknowledge_pause_or_resume_and_stop_wins() {
         let state = Mutex::new(Progress::default());
         let stop = AtomicBool::new(false);
@@ -553,7 +580,7 @@ mod tests {
         let release = stop_requested.clone();
         let output = path.clone();
         let exit = thread::spawn(move || {
-            persist_exit_progress(&state, &flag, 12345, &output, || {
+            persist_exit_progress(&state, &flag, 12345, 6789, &output, || {
                 entered.wait();
                 release.wait();
             })
@@ -571,6 +598,7 @@ mod tests {
         let saved: Progress = library::read_json(&path).unwrap();
         assert_eq!(saved.phase, Phase::Stopping);
         assert_eq!(saved.peak_job_committed_bytes, 12345);
+        assert_eq!(saved.worker_cpu_100ns, 6789);
     }
     #[test]
     fn stop_acknowledged_after_a_reader_snapshot_cannot_be_overwritten() {

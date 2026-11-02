@@ -123,6 +123,88 @@ impl Job {
         }
         Ok(info.PeakJobMemoryUsed)
     }
+    pub fn cpu_100ns(&self) -> Result<u64> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: The buffer matches the queried information class for this owned job.
+        unsafe {
+            QueryInformationJobObject(
+                HANDLE(self.handle.as_raw_handle()),
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut _,
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                None,
+            )?;
+        }
+        ensure!(
+            info.TotalKernelTime >= 0 && info.TotalUserTime >= 0,
+            "Invalid process-family CPU accounting."
+        );
+        Ok(info.TotalKernelTime as u64 + info.TotalUserTime as u64)
+    }
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct ProcessStats {
+    pub cpu_100ns: u64,
+    pub private_bytes: usize,
+    pub system_idle_100ns: u64,
+    pub system_total_100ns: u64,
+}
+
+fn filetime_ticks(time: windows::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+}
+
+pub fn current_process_stats() -> Result<ProcessStats> {
+    use windows::Win32::{
+        Foundation::FILETIME,
+        System::{
+            ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX},
+            Threading::{GetCurrentProcess, GetProcessTimes, GetSystemTimes},
+        },
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    let (mut idle, mut system_kernel, mut system_user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    let mut memory = PROCESS_MEMORY_COUNTERS_EX {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: Read only this process's counters and aggregate system counters into correctly sized storage.
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )?;
+        GetSystemTimes(
+            Some(&mut idle),
+            Some(&mut system_kernel),
+            Some(&mut system_user),
+        )?;
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut memory as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
+            memory.cb,
+        )
+        .ok()?;
+    }
+    Ok(ProcessStats {
+        cpu_100ns: filetime_ticks(kernel) + filetime_ticks(user),
+        private_bytes: memory.PrivateUsage,
+        system_idle_100ns: filetime_ticks(idle),
+        system_total_100ns: filetime_ticks(system_kernel) + filetime_ticks(system_user),
+    })
 }
 
 pub fn free_space(path: &Path) -> Result<u64> {
@@ -288,9 +370,7 @@ pub fn current_thread_cpu_100ns() -> Result<u64> {
             &mut user,
         )?;
     }
-    let ticks =
-        |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
-    Ok(ticks(kernel) + ticks(user))
+    Ok(filetime_ticks(kernel) + filetime_ticks(user))
 }
 
 pub struct ProcessExit {

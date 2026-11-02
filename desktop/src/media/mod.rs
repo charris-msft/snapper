@@ -172,6 +172,10 @@ pub struct Progress {
     pub peak_audio_queue_bytes: usize,
     #[serde(default)]
     pub peak_job_committed_bytes: usize,
+    #[serde(default)]
+    pub worker_cpu_100ns: u64,
+    #[serde(default)]
+    pub timeline_origin_100ns: i64,
 }
 
 pub(crate) fn mark_fault(request: &Request, fault: TestFault) -> Result<()> {
@@ -232,6 +236,14 @@ pub fn entry() -> Result<()> {
                 .unwrap_or(std::env::current_dir()?.join("artifacts").join("profile-acceptance"));
             let seconds=args.get(2).map(|s|s.parse::<u64>()).transpose()?.unwrap_or(60);
             profile::run(&directory,seconds)
+        },
+        Some("--native-profile") => {
+            let request: Request = library::read_json(std::path::Path::new(args.get(1).context("Explicit native profile request JSON is required")?))?;
+            let directory = PathBuf::from(args.get(2).context("Native profile evidence directory is required")?);
+            profile::native(&request, &directory, args.get(3).is_some_and(|s| s == "--approve-screen-capture"))
+        },
+        Some("--encoder-diagnostics") => {
+            profile::encoder_diagnostics(&PathBuf::from(args.get(1).context("Encoder diagnostic directory is required")?))
         },
         Some("--devices")=>{
             let monitors=crate::platform::screen::monitors()?;

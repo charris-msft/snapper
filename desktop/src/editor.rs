@@ -29,6 +29,119 @@ const TEAL: Color32 = Color32::from_rgb(0, 128, 124);
 const INK: Color32 = Color32::from_rgb(31, 43, 61);
 const RECENT_TEXTURE_LIMIT: usize = 24;
 
+fn annotation_icon(painter: &egui::Painter, rect: Rect, tool: Tool, color: Color32) {
+    let p = |x: f32, y: f32| rect.min + Vec2::new(x, y);
+    let stroke = Stroke::new(1.5_f32, color);
+    let line = |points: &[(f32, f32)]| {
+        painter.add(egui::Shape::line(
+            points.iter().map(|&(x, y)| p(x, y)).collect(),
+            stroke,
+        ));
+    };
+    match tool {
+        Tool::Select => line(&[
+            (3.0, 2.0),
+            (3.0, 14.0),
+            (7.0, 10.0),
+            (11.0, 15.0),
+            (13.0, 13.0),
+            (9.0, 8.0),
+            (15.0, 8.0),
+            (3.0, 2.0),
+        ]),
+        Tool::Arrow => painter.arrow(p(2.0, 14.0), Vec2::new(12.0, -12.0), stroke),
+        Tool::Text => {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "T",
+                egui::FontId::proportional(17.0),
+                color,
+            );
+        }
+        Tool::Callout => {
+            painter.rect_stroke(
+                Rect::from_min_max(p(1.0, 2.0), p(15.0, 12.0)),
+                3.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            line(&[(4.0, 12.0), (4.0, 16.0), (8.0, 12.0)]);
+        }
+        Tool::Rectangle => {
+            painter.rect_stroke(rect.shrink(2.0), 1.0, stroke, egui::StrokeKind::Inside);
+        }
+        Tool::Ellipse => {
+            painter.circle_stroke(rect.center(), 6.0, stroke);
+        }
+        Tool::Line => line(&[(2.0, 14.0), (14.0, 2.0)]),
+        Tool::Stamp => line(&[(2.0, 8.0), (6.0, 13.0), (15.0, 3.0)]),
+        Tool::Fill => {
+            for (x, y) in [(2.0, 2.0), (7.0, 2.0), (7.0, 7.0), (12.0, 7.0), (7.0, 12.0)] {
+                painter.rect_filled(Rect::from_min_size(p(x, y), Vec2::splat(4.0)), 0.0, color);
+            }
+        }
+        Tool::Replace => {
+            painter.circle_filled(p(4.0, 4.0), 3.0, color);
+            painter.circle_stroke(p(12.0, 12.0), 3.0, stroke);
+            painter.arrow(p(1.0, 12.0), Vec2::new(5.0, 0.0), stroke);
+            painter.arrow(p(15.0, 4.0), Vec2::new(-5.0, 0.0), stroke);
+        }
+        Tool::Blur => {
+            for radius in [6.0, 3.5, 1.0] {
+                painter.circle_stroke(rect.center(), radius, stroke);
+            }
+        }
+        Tool::Pixelate => {
+            for y in 0..3 {
+                for x in 0..3 {
+                    if (x + y) % 2 == 0 {
+                        painter.rect_filled(
+                            Rect::from_min_size(
+                                p(1.0 + x as f32 * 5.0, 1.0 + y as f32 * 5.0),
+                                Vec2::splat(4.0),
+                            ),
+                            0.0,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+        Tool::Highlight => {
+            painter.line_segment([p(2.0, 12.0), p(14.0, 12.0)], Stroke::new(4.0_f32, color));
+            line(&[(4.0, 3.0), (12.0, 3.0)]);
+        }
+        Tool::Eraser => line(&[
+            (2.0, 11.0),
+            (9.0, 2.0),
+            (15.0, 7.0),
+            (9.0, 15.0),
+            (6.0, 15.0),
+            (2.0, 11.0),
+            (8.0, 11.0),
+        ]),
+        Tool::CutHorizontal => {
+            line(&[(1.0, 4.0), (15.0, 4.0)]);
+            line(&[(1.0, 12.0), (15.0, 12.0)]);
+        }
+        Tool::CutVertical => {
+            line(&[(4.0, 1.0), (4.0, 15.0)]);
+            line(&[(12.0, 1.0), (12.0, 15.0)]);
+        }
+        Tool::CutJagged => {
+            line(&[(1.0, 5.0), (4.0, 2.0), (7.0, 6.0), (10.0, 2.0), (15.0, 5.0)]);
+            line(&[
+                (1.0, 13.0),
+                (4.0, 10.0),
+                (7.0, 14.0),
+                (10.0, 10.0),
+                (15.0, 13.0),
+            ]);
+        }
+    }
+}
+
 #[derive(Default)]
 struct ThumbnailCache {
     textures: HashMap<String, TextureHandle>,
@@ -369,12 +482,40 @@ pub struct Editor {
     video_metadata_dirty: bool,
 }
 
+fn native_icon() -> egui::IconData {
+    let mut rgba = Vec::with_capacity(32 * 32 * 4);
+    for y in 0i32..32 {
+        for x in 0i32..32 {
+            let corner_x = x.min(31 - x);
+            let corner_y = y.min(31 - y);
+            let inside = corner_x >= 7
+                || corner_y >= 7
+                || (7 - corner_x).pow(2) + (7 - corner_y).pow(2) <= 49;
+            let mark = ((6..=8).contains(&corner_x) && (6..=13).contains(&corner_y))
+                || ((6..=8).contains(&corner_y) && (6..=13).contains(&corner_x));
+            rgba.extend(if !inside {
+                [0, 0, 0, 0]
+            } else if mark {
+                [255, 255, 255, 255]
+            } else {
+                [0, 128, 124, 255]
+            });
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: 32,
+        height: 32,
+    }
+}
+
 fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([560.0, 680.0])
             .with_min_inner_size([480.0, 440.0])
-            .with_title("Snapper"),
+            .with_title("Snapper")
+            .with_icon(Arc::new(native_icon())),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: crate::graphics::configuration(),
         ..Default::default()
@@ -901,11 +1042,30 @@ impl Editor {
                                 Tool::Replace => "Color replace",
                                 _ => tool.label(),
                             };
-                            if ui
-                                .selectable_label(self.tool == tool, label)
-                                .on_hover_text(tool.label())
-                                .clicked()
-                            {
+                            let selected = self.tool == tool;
+                            let response = ui
+                                .selectable_label(selected, format!("     {label}"))
+                                .on_hover_text(tool.label());
+                            let color = if !ui.is_enabled() {
+                                Color32::GRAY
+                            } else if selected {
+                                Color32::WHITE
+                            } else {
+                                INK
+                            };
+                            annotation_icon(
+                                ui.painter(),
+                                Rect::from_center_size(
+                                    Pos2::new(
+                                        response.rect.left() + 12.0,
+                                        response.rect.center().y,
+                                    ),
+                                    Vec2::splat(18.0),
+                                ),
+                                tool,
+                                color,
+                            );
+                            if response.clicked() {
                                 self.change_tool(tool);
                             }
                         }

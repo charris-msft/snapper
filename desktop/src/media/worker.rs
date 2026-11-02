@@ -809,6 +809,7 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
         .origin
         .store(platform::clock_100ns()?, Ordering::Release);
     let origin = shared.origin.load(Ordering::Acquire);
+    shared.update(|p| p.timeline_origin_100ns = origin);
     let mut audio_timelines = Vec::new();
     if request.sources.system_audio {
         audio_timelines.push(AudioTimeline::new(true, origin));
