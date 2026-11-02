@@ -1367,6 +1367,68 @@ mod tests {
     }
 
     #[test]
+    fn audio_queue_clips_cross_origin_gap_and_releases_all_charged_pcm() {
+        use platform::audio::{Packet, PacketTiming};
+        let shared = audio_test_state();
+        let (tx, rx) = bounded(512);
+        let devices = Devices {
+            shared: shared.clone(),
+            threads: vec![],
+            screen: Arc::new(Mutex::new(None)),
+            camera: Arc::new(Mutex::new(None)),
+            audio: rx,
+        };
+        let mut timelines = vec![
+            AudioTimeline::new(true, 4_900_000),
+            AudioTimeline::new(false, 4_900_000),
+        ];
+        for (sequence, position, timestamp, marker) in [(1, 0, 0, 1), (2, 22_535, 5_110_000, 7)] {
+            send_audio(
+                &shared,
+                &tx,
+                AudioEvent::Packet {
+                    index: 1,
+                    observed: 5_210_000,
+                    packet: Packet {
+                        timing: PacketTiming {
+                            sequence,
+                            device_position: position,
+                            timestamp,
+                            frames: 480,
+                            flags: 0,
+                            client_rate_hz: 48_000,
+                            engine_mix_rate_hz: Some(44_100),
+                        },
+                        pcm: vec![marker; 1920],
+                    },
+                },
+            )
+            .unwrap();
+        }
+        receive_audio(&devices, &mut timelines, &shared).unwrap();
+        assert_eq!(shared.audio_bytes.load(Ordering::Acquire), 1920);
+        let mut output = Vec::new();
+        write_audio_until(
+            &mut timelines,
+            &PauseTimeline::default(),
+            1488,
+            1488,
+            false,
+            |index, ms, pcm| {
+                output.push((index, ms, pcm.to_vec()));
+                Ok(())
+            },
+            &shared,
+        )
+        .unwrap();
+        assert!(output == vec![(1, 0, vec![0; 1008 * 4]), (1, 21, vec![7; 1920])]);
+        assert_eq!(shared.audio_bytes.load(Ordering::Acquire), 0);
+        let progress = shared.progress.lock().unwrap();
+        assert_eq!(progress.peak_audio_queue_bytes, 3840);
+        assert_eq!(progress.audio_silence_frames, 1008);
+    }
+
+    #[test]
     fn deferred_audio_failures_keep_the_correct_queued_pair_and_selected_index() {
         use platform::audio::{Packet, PacketTiming};
         use windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;

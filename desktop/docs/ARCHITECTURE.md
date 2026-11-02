@@ -121,6 +121,11 @@ That narrow phase-carry condition is not a capture-rejection tolerance: modest
 native-clock variation still uses the existing active overlap/gap budgets after
 pause projection. The phase rule adds no arrival-clock substitution, unbounded
 drift correction, silence policy, or new fatal jitter threshold.
+Gap intervals retain their signed client-sample start until admission. Both
+ends are clipped to the recording origin before excluding pauses and applying
+the active-gap budget, so discarded pre-origin time cannot be charged as missing
+recorded audio. Packet placement and the stored diagnostic predecessor remain
+unchanged by that clipping.
 Invalid timestamps, backward QPC, oversized
 packets and active-time gap/overlap budgets remain fail-closed. See Microsoft's
 [`AUDCLNT_BUFFERFLAGS` contract](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/ne-audioclient-_audclnt_bufferflags).

@@ -64,7 +64,7 @@ struct Pending {
     offset: usize,
     packet: Packet,
     previous_packet: Option<PacketTiming>,
-    packet_gap: Option<(u64, u64)>,
+    packet_gap: Option<(i128, u64)>,
 }
 
 pub struct AudioTimeline {
@@ -131,8 +131,7 @@ impl AudioTimeline {
             None
         } else if let Some(previous) = self.last_packet {
             Some((
-                u64::try_from(self.previous_sample_end.max(0))
-                    .context("Audio endpoint sample overflow")?,
+                self.previous_sample_end,
                 packet_gap_frames(previous, timing)?,
             ))
         } else {
@@ -278,10 +277,16 @@ impl AudioTimeline {
                 continue;
             }
             if let Some((previous, missing)) = front.packet_gap {
-                let paused = clock.paused_between(previous.min(start), start);
+                let clipped_start = previous.max(0);
+                let clipped_end = (previous + i128::from(missing)).max(0);
+                let retained = u64::try_from(clipped_end - clipped_start)
+                    .context("Retained audio gap overflow")?;
+                let previous_sample =
+                    u64::try_from(clipped_start).context("Audio gap start overflow")?;
+                let paused = clock.paused_between(previous_sample.min(start), start);
                 ensure!(
-                    missing.saturating_sub(paused) <= 24_000,
-                    "{source}: audio packet gap exceeds 500 ms of active client samples. current=[{timing}] previous=[{}] missing_frames={missing} paused_frames={paused}.",
+                    retained.saturating_sub(paused) <= 24_000,
+                    "{source}: audio packet gap exceeds 500 ms of active client samples. current=[{timing}] previous=[{}] missing_frames={retained} full_gap_frames={missing} signed_gap_start={previous} paused_frames={paused}.",
                     predecessor()
                 );
                 self.pending.front_mut().unwrap().packet_gap = None;
@@ -465,6 +470,92 @@ mod tests {
             assert_eq!(output, expected);
             assert_eq!(timeline.take_released_bytes(), 3840);
         }
+    }
+
+    #[test]
+    fn converted_gap_crossing_origin_counts_only_retained_time() {
+        for system in [false, true] {
+            for retained_gap in [1008, 24_000, 24_001] {
+                let mut timeline = AudioTimeline::new(system, 4_900_000);
+                let mut first = packet(0, 0, 480, 1);
+                first.timing.engine_mix_rate_hz = Some(44_100);
+                timeline.observe(first, 4_910_000).unwrap();
+                let timestamp = 4_900_000 + (retained_gap * 10_000_000 / SAMPLE_RATE) as i64;
+                let mut next = packet(timestamp as u64 * 44_100 / 10_000_000, 0, 480, 7);
+                next.timing.sequence = 2;
+                next.timing.timestamp = timestamp;
+                next.timing.engine_mix_rate_hz = Some(44_100);
+                timeline.observe(next, timestamp + 100_000).unwrap();
+                if retained_gap <= 24_000 {
+                    let output =
+                        drain(&mut timeline, &PauseTimeline::default(), retained_gap + 480);
+                    let mut zeros = 0;
+                    let mut marker = Vec::new();
+                    for (sample, pcm) in output {
+                        if pcm[0] == 0 {
+                            zeros += pcm.len() / 4;
+                        } else {
+                            assert_eq!(sample, retained_gap);
+                            marker.extend(pcm);
+                        }
+                    }
+                    assert_eq!(zeros as u64, retained_gap);
+                    assert!(marker == vec![7; 1920]);
+                    assert_eq!(timeline.committed, retained_gap + 480);
+                    assert_eq!(timeline.take_released_bytes(), 3840);
+                } else {
+                    let result = timeline.prepare_next(
+                        &PauseTimeline::default(),
+                        retained_gap + 480,
+                        u64::MAX,
+                        false,
+                    );
+                    let error = match result {
+                        Err(error) => format!("{error:#}"),
+                        Ok(_) => panic!("A true post-origin gap above 500 ms was accepted."),
+                    };
+                    for field in [
+                        "missing_frames=24001",
+                        "full_gap_frames=47041",
+                        "signed_gap_start=-23040",
+                        "current=[sequence=2",
+                        "previous=[sequence=1",
+                    ] {
+                        assert!(error.contains(field), "{error}");
+                    }
+                    assert_eq!(timeline.discard_pending(), 3840);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn converted_cross_origin_gap_excludes_pause_before_frozen_stop() {
+        let mut clock = PauseTimeline::default();
+        clock.set_paused(480, true).unwrap();
+        clock.set_paused(24_480, false).unwrap();
+        clock.freeze(25_135);
+        let mut timeline = AudioTimeline::new(false, 4_900_000);
+        let mut first = packet(0, 0, 480, 1);
+        first.timing.engine_mix_rate_hz = Some(44_100);
+        timeline.observe(first, 4_910_000).unwrap();
+        let timestamp = 4_900_000 + 25_008 * 10_000_000 / SAMPLE_RATE;
+        let mut next = packet(timestamp * 44_100 / 10_000_000, 0, 480, 7);
+        next.timing.sequence = 2;
+        next.timing.timestamp = timestamp as i64;
+        next.timing.engine_mix_rate_hz = Some(44_100);
+        timeline.observe(next, timestamp as i64 + 100_000).unwrap();
+        let mut output = Vec::new();
+        while let Some(prepared) = timeline
+            .prepare_next(&clock, 25_135, u64::MAX, true)
+            .unwrap()
+        {
+            output.push((prepared.sample, prepared.pcm.clone()));
+            timeline.commit(&prepared).unwrap();
+        }
+        assert!(output == vec![(0, vec![0; 1008 * 4]), (1008, vec![7; 127 * 4])]);
+        assert_eq!(timeline.committed, 1135);
+        assert_eq!(timeline.take_released_bytes(), 3840);
     }
 
     #[test]
