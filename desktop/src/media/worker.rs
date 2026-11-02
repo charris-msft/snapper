@@ -268,7 +268,7 @@ impl Devices {
                     while state.origin.load(Ordering::Acquire) == 0
                         && !state.stop.load(Ordering::Acquire)
                     {
-                        if let Some(native) = native.as_ref() {
+                        if let Some(native) = native.as_mut() {
                             for _ in 0..64 {
                                 if native.packet()?.is_none() {
                                     break;
@@ -285,7 +285,7 @@ impl Devices {
                     let mut last_packet = Instant::now();
                     let mut next_drained = Instant::now();
                     while !state.stop.load(Ordering::Acquire) {
-                        if let Some(native) = native.as_ref() {
+                        if let Some(native) = native.as_mut() {
                             while let Some(packet) = native.packet()? {
                                 last_packet = Instant::now();
                                 send_audio(
@@ -314,14 +314,19 @@ impl Devices {
                                         index: this_index,
                                         observed: platform::clock_100ns()?,
                                         packet: platform::audio::Packet {
-                                            timestamp: origin
-                                                + (i128::from(next_frame) * 10_000_000
-                                                    / i128::from(SAMPLE_RATE))
-                                                    as i64,
-                                            device_position: next_frame,
-                                            frames: 480,
+                                            timing: platform::audio::PacketTiming {
+                                                sequence: next_frame / 480 + 1,
+                                                timestamp: origin
+                                                    + (i128::from(next_frame) * 10_000_000
+                                                        / i128::from(SAMPLE_RATE))
+                                                        as i64,
+                                                device_position: next_frame,
+                                                frames: 480,
+                                                flags: 0,
+                                                client_rate_hz: SAMPLE_RATE as u32,
+                                                engine_mix_rate_hz: None,
+                                            },
                                             pcm,
-                                            discontinuity: false,
                                         },
                                     },
                                 )?;
@@ -543,7 +548,9 @@ fn receive_audio(devices: &Devices, timelines: &mut [AudioTimeline], state: &Sha
             .get_mut(index as usize)
             .context("Audio event has an unselected source index")?;
         if let Some(packet) = packet {
-            let discontinuity = timeline.observe(packet, observed)?;
+            let discontinuity = timeline
+                .observe(packet, observed)
+                .with_context(|| format!("Admitting selected audio stream index={index}"))?;
             state.update(|p| p.audio_discontinuities += u64::from(discontinuity));
         } else {
             timeline.observe_drained(observed)?;
@@ -1196,6 +1203,162 @@ pub fn synthetic_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn audio_test_state() -> Shared {
+        Shared {
+            stop: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
+            origin: Arc::new(AtomicI64::new(1)),
+            media_sample: Arc::new(AtomicU64::new(0)),
+            control: Arc::new(AtomicU64::new(0)),
+            stop_clock: Arc::new(AtomicI64::new(0)),
+            error: Arc::new(Mutex::new(None)),
+            progress: Arc::new(Mutex::new(Progress::default())),
+            audio_bytes: Arc::new(AtomicUsize::new(0)),
+            audio_limit: 768_000,
+        }
+    }
+
+    #[test]
+    fn audio_queue_preserves_source_order_and_discontinuity_boundaries() {
+        use platform::audio::{Packet, PacketTiming};
+        use windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
+        for sources in [vec![true], vec![false], vec![true, false]] {
+            let shared = audio_test_state();
+            let (tx, rx) = bounded(512);
+            let devices = Devices {
+                shared: shared.clone(),
+                threads: vec![],
+                screen: Arc::new(Mutex::new(None)),
+                camera: Arc::new(Mutex::new(None)),
+                audio: rx,
+            };
+            let mut timelines = sources
+                .iter()
+                .map(|&system| AudioTimeline::new(system, 0))
+                .collect::<Vec<_>>();
+            for step in 0..3 {
+                for (index, _) in sources.iter().enumerate().rev() {
+                    send_audio(
+                        &shared,
+                        &tx,
+                        AudioEvent::Packet {
+                            index: index as u8,
+                            observed: (step + 1) as i64 * 100_000,
+                            packet: Packet {
+                                timing: PacketTiming {
+                                    sequence: step + 1,
+                                    timestamp: step as i64 * 100_000,
+                                    device_position: match step {
+                                        0 => 9600,
+                                        1 => 0,
+                                        _ => 480,
+                                    },
+                                    frames: 480,
+                                    flags: if step == 1 {
+                                        AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32
+                                    } else {
+                                        0
+                                    },
+                                    client_rate_hz: SAMPLE_RATE as u32,
+                                    engine_mix_rate_hz: Some(if sources[index] {
+                                        48_000
+                                    } else {
+                                        16_000
+                                    }),
+                                },
+                                pcm: vec![index as u8 * 10 + step as u8 + 1; 1920],
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            receive_audio(&devices, &mut timelines, &shared).unwrap();
+            assert_eq!(
+                shared.progress.lock().unwrap().audio_discontinuities,
+                sources.len() as u64
+            );
+            for (index, timeline) in timelines.iter_mut().enumerate() {
+                for step in 0..3u64 {
+                    let prepared = timeline
+                        .prepare_next(&PauseTimeline::default(), 1440, 1440, true)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(prepared.sample, step * 480);
+                    assert_eq!(prepared.silence_frames, 0);
+                    assert_eq!(prepared.pcm, vec![index as u8 * 10 + step as u8 + 1; 1920]);
+                    timeline.commit(&prepared).unwrap();
+                    shared
+                        .audio_bytes
+                        .fetch_sub(timeline.take_released_bytes(), Ordering::AcqRel);
+                }
+                assert!(timeline
+                    .prepare_next(&PauseTimeline::default(), 1440, 1440, true)
+                    .unwrap()
+                    .is_none());
+            }
+            assert_eq!(shared.audio_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(
+                shared.progress.lock().unwrap().peak_audio_queue_bytes,
+                sources.len() * 5760
+            );
+        }
+    }
+
+    #[test]
+    fn audio_queue_failure_names_the_actual_selected_source_index() {
+        use platform::audio::{Packet, PacketTiming};
+        let shared = audio_test_state();
+        let (tx, rx) = bounded(512);
+        let devices = Devices {
+            shared: shared.clone(),
+            threads: vec![],
+            screen: Arc::new(Mutex::new(None)),
+            camera: Arc::new(Mutex::new(None)),
+            audio: rx,
+        };
+        let mut timelines = vec![AudioTimeline::new(true, 0), AudioTimeline::new(false, 0)];
+        for step in 0..2 {
+            send_audio(
+                &shared,
+                &tx,
+                AudioEvent::Packet {
+                    index: 1,
+                    observed: (step + 1) as i64 * 100_000,
+                    packet: Packet {
+                        timing: PacketTiming {
+                            sequence: step + 1,
+                            timestamp: step as i64 * 100_000,
+                            device_position: if step == 0 { 9600 } else { 0 },
+                            frames: 480,
+                            flags: 0,
+                            client_rate_hz: SAMPLE_RATE as u32,
+                            engine_mix_rate_hz: Some(16_000),
+                        },
+                        pcm: vec![17; 1920],
+                    },
+                },
+            )
+            .unwrap();
+        }
+        let error = format!(
+            "{:#}",
+            receive_audio(&devices, &mut timelines, &shared).unwrap_err()
+        );
+        for field in [
+            "index=1",
+            "Microphone",
+            "Unflagged",
+            "previous_end=10080",
+            "flags=0x0",
+            "engine_mix_rate_hz=Some(16000)",
+        ] {
+            assert!(error.contains(field), "{error}");
+        }
+        assert!(!error.contains("System audio"));
+        assert_eq!(shared.progress.lock().unwrap().audio_discontinuities, 0);
+    }
+
     #[test]
     fn held_frame_sealing_closes_a_slow_write_gap_without_extra_normal_frames() {
         assert_eq!(held_tail_timestamp(800, 1200), Some(1167));

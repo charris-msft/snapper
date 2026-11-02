@@ -99,6 +99,20 @@ sample positions and QPC-derived sample positions are checked before converting
 only the transport timestamp to milliseconds. Native sources drain pre-origin
 samples while waiting at the common start barrier.
 
+WASAPI's `DATA_DISCONTINUITY` flag ends correlation with the previous packet's
+device position, so it starts a new position-checking epoch without resetting
+the QPC/media timeline or replacing PCM. The next unflagged packet must again
+follow the prior packet's end. Invalid timestamps, backward QPC, oversized
+packets and active-time gap/overlap budgets remain fail-closed. See Microsoft's
+[`AUDCLNT_BUFFERFLAGS` contract](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/ne-audioclient-_audclnt_bufferflags).
+Admission errors include the source role/index, previous/current packet sequence,
+positions, frame counts, QPC values, raw flags and client/engine mix rates. The
+engine rate comes from `GetMixFormat` on the already selected client; it is not
+an inferred physical hardware rate. Diagnostics contain no PCM or images.
+Contract counterexamples are generated inputs, not replays of a native failure
+whose packet metadata was not recorded. Native source attribution and confirmation
+still require a separately approved run when the historical trace is absent.
+
 Pause/resume boundaries and media admission have one writer-thread owner.
 The stdin thread queues a sequenced desired state; it never acknowledges a
 pause while a previous pipe write is still in flight. Acknowledgements carry
