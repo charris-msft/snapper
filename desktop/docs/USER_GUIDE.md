@@ -1,21 +1,35 @@
-# SteadyCapture user guide
+# Snapper desktop user guide
 
 ## Capture
 
-1. Choose the monitor on the left. **Region (physical pixels)** accepts a
-   monitor-relative left/top/width/height. **Whole monitor** resets it.
-2. Independently choose cursor, webcam, system audio and microphone. For webcam,
-   **Scan cameras** lists devices without activating them; choose one explicitly.
-   The microphone and system-audio choices use Windows' default input/output
-   devices. System audio includes other applications playing on that output.
-3. Choose **Take screenshot** or **Record screen**. Devices remain closed during
-   the visible three-second countdown. Cancel the countdown or press Escape to
-   cancel before activation.
-4. During recording, the left panel shows active-source choices, elapsed time,
-   recorded/skipped frames and a red Stop button. Ctrl+Shift+F9 stops from any
-   application without waiting for editor painting. Escape stops recording while
-   the application window has keyboard focus. A shortcut-registration conflict
-   is reported explicitly; the button and focused Escape still work.
+1. In the compact launcher, choose **Screenshot** or **Recording**, then
+   **Region**, **Full monitor** or **Window guide** and the monitor.
+   **Select area** opens a native overlay. Drag a rectangle, move inside it,
+   or resize with its eight handles. The dimensions are physical pixels.
+   Enter or **Review sources** continues. Arrow keys move one pixel, Shift
+   moves ten, and Ctrl plus an arrow resizes. Precision fields are also
+   available in preflight.
+2. **Esc to cancel** stays visible throughout selection, adjustment, source
+   review and countdown. It cancels the entire operation, including an
+   unfinished mouse drag, releases input ownership and returns prior focus.
+   Late mouse-up/timer events cannot restart a cancelled selection. Escape is
+   registered only for the active flow, not globally while idle. At the exact
+   start-admission boundary, an already-admitted Escape becomes Stop for that
+   recording instead of being lost.
+3. Review the four independent source choices. **Refresh devices** lists
+   cameras, microphones and output routes without opening streams. Choose
+   the named devices you want. System audio includes the entire mix on the
+   chosen output, including other applications. **Preview camera (turns camera
+   on)** is a separate explicit action. Drag its placement tile and adjust its
+   width; stop the preview or start capture to release preview ownership.
+4. Choose **Capture** or **Record** to arm the configurable 0-10 second
+   countdown. A camera preview is released before countdown. No recording
+   source starts during selection/review/countdown. During recording, a small
+   movable dock provides **Pause**, **Resume** and **Stop**. Its elapsed time
+   excludes pauses. Selected devices remain on during Pause, but paused screen
+   pixels and audio samples are not admitted to the recording.
+   Ctrl+Shift+F9 stops from any application without waiting for editor painting.
+   Settings can change this shortcut. Conflicts are reported, never stolen.
 5. Wait for **Saved**. Stopping, devices released, finalizing and saved are
    different states. A stop request alone does not mean the file is finished.
    **Cancel finalization** ends a blocked export while keeping committed
@@ -23,9 +37,12 @@
 
 Screenshots retain the selected native pixel dimensions. Recording preserves
 aspect ratio and fits the region within 1920 x 1080, with even dimensions and a
-30 Hz target schedule. Webcam picture-in-picture appears at the bottom right.
+30 Hz target schedule. Preflight shows both the selected source resolution and
+the actual output resolution; scaling is explicit. Encoding currently uses
+software H.264/libx264, not an asserted hardware encoder. Camera picture-in-picture
+position and width are adjustable before capture.
 Camera input is bounded to a negotiated mode at or below 1280 x 720 and 30 fps.
-Recordings stop at the selected 1-120 minute limit. They also stop on explicit
+Recordings stop at the selected 1-120 minute active-media limit. They also stop on explicit
 device/timing/queue failures or low free space, rather than silently dropping a
 selected source. Protected content, secure desktops, unsupported graphics
 drivers and known physical HDR displays are not supported capture targets.
@@ -34,6 +51,25 @@ capture and explicit linear-to-sRGB SDR conversion. Bright values above SDR
 white are clipped; this is not an HDR-preserving export. The active path is
 displayed while recording. Monitor coordinates are physical pixels, not
 DPI-scaled browser/window coordinates.
+
+Window guide uses a window's bounds to select a **fixed screen region**. It does
+not isolate window content, follow a moved window or hide overlapping windows.
+A selected region must fit one monitor. Snapper does not promise cross-monitor
+video. The dock is excluded through Windows display affinity; recording does
+not start if that exclusion cannot be established.
+
+## Repeat captures and preferences
+
+The default capture and repeat-region shortcuts are Ctrl+Shift+F8 and
+Ctrl+Shift+F7. Repeat returns to source review, not directly into recording.
+The last saved region is revalidated against monitor identity, physical
+position, resolution and DPI. A changed or disconnected display requires a
+fresh selection.
+
+Settings stores up to 20 named capture presets, independent source choices,
+device IDs, camera layout, destination, shortcuts and the Recent-strip
+preference. Loading a preset or restarting Snapper never activates hardware.
+Unreadable settings are reported without overwriting the damaged file.
 
 ## Edit images
 
@@ -59,8 +95,8 @@ remove secrets. Editable projects intentionally retain originals and history
 operations; share a flattened export instead of a project when that distinction
 matters. Fully erased pixels in flattened PNG have their RGB cleared as well.
 
-Quick Styles save tool properties for reuse; the star button pins/unpins
-Favorites. Styles and Favorites survive restart. The Effects/Properties control
+The inspector's saved-style chooser reuses tool properties; **Pin**/**Unpin**
+controls Favorites. Styles and Favorites survive restart. The Effects/Properties control
 exposes grayscale, an inset border, original dimensions and layer count.
 Zoom affects only display size, not exported pixels.
 
@@ -84,14 +120,24 @@ writes PNG, or JPEG at quality 95 with transparent pixels composited over white.
 JPEG is lossy; it cannot preserve pixel equality with the source.
 
 For videos, **Play recording** opens the local MP4 in the configured Windows
-player. **Save MP4 as** copies it elsewhere. Video trimming and a video-annotation
+player. Titles and tags use **Save title and tags** without rewriting the MP4.
+**Save MP4 as** copies it elsewhere. Video trimming and a video-annotation
 timeline are not part of this application.
+
+Preflight's **After capture** choice routes a screenshot directly to the editor,
+bitmap clipboard or a chosen local folder. Video routes to the library view or
+a local file. Automatic file routing uses a unique capture name and atomic
+publication without overwriting a competing file. Every route retains the
+immutable local-library original. A clipboard/export failure is reported
+without discarding that original.
 
 ## Storage and recovery
 
-The default library is `%LOCALAPPDATA%\SteadyCapture\Library`. Each image has
+The default library is `%LOCALAPPDATA%\Snapper\Library`. Each image has
 an immutable `original.png`, a versioned editable document, a thumbnail and
 capture metadata. Tags/Quick Styles are local JSON. There is no external upload.
+The prior application's library is not moved or copied automatically. Use
+`--data-dir <absolute directory>` to deliberately open another local library.
 
 Recordings retain independently finalized MP4 segments in a private per-user
 session folder. Every published segment is decoded, flushed, renamed and then
@@ -124,7 +170,13 @@ as proof that your recording was recovered.
 - 128 saved styles, 32 tags per capture, 5,000 indexed capture folders.
 - One active capture/recording and one library/export job per window.
 - A latest-frame mailbox per visual source; two seconds of PCM queue capacity
-  per selected audio source (maximum 768,000 bytes), plus a 512-message cap.
+  per selected audio source (maximum 768,000 queued/staged bytes), a 512-message
+  channel cap and at most 512 pending packets per source. A single prepared
+  100 ms PCM span adds at most 19,200 bytes. Native acquisition buffers and
+  third-party encoder internals are separate allocations.
+- 4,096 pause intervals per recording. A pending pause/resume or pipe write
+  has a five-second wall-time watchdog; pausing the media clock does not
+  disable shutdown monitoring.
 - A selected microphone must deliver a real packet within one second and must
   keep delivering packets. Timestamped Windows `SILENT` packets are legitimate;
   missing packets do not turn the microphone into an invented silence track.

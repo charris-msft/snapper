@@ -17,7 +17,8 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::KeyboardAndMouse::{
-                EnableWindow, GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_SHIFT,
+                EnableWindow, GetCapture, GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL,
+                VK_SHIFT,
             },
             WindowsAndMessaging::*,
         },
@@ -536,6 +537,8 @@ unsafe extern "system" fn window_proc(
             | WM_KEYDOWN
             | WM_LBUTTONDOWN
             | WM_MOUSEMOVE
+            | WM_CAPTURECHANGED
+            | WM_CANCELMODE
             | WM_LBUTTONUP
             | WM_PAINT
     ) {
@@ -553,6 +556,16 @@ unsafe extern "system" fn window_proc(
     let x = (lparam.0 as u16 as i16) as i32;
     let y = ((lparam.0 >> 16) as u16 as i16) as i32;
     match message {
+        WM_CAPTURECHANGED => {
+            if lparam.0 != hwnd.0 as isize && state.selection.capture_lost() {
+                finish(hwnd, state, Ok(None));
+            }
+            LRESULT(0)
+        }
+        WM_CANCELMODE => {
+            finish(hwnd, state, Ok(None));
+            LRESULT(0)
+        }
         WM_CLOSE => {
             finish(hwnd, state, Ok(None));
             LRESULT(0)
@@ -621,11 +634,27 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            state.selection.motion(x, y);
+            // SAFETY: Query this thread's current mouse-capture owner without changing it.
+            let captured = unsafe { GetCapture() } == hwnd;
+            if !state
+                .selection
+                .captured_motion(x, y, wparam.0 & 1 != 0, captured)
+            {
+                finish(hwnd, state, Ok(None));
+                return LRESULT(0);
+            }
             refresh(hwnd, state);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            if !state.selection.dragging() {
+                return LRESULT(0);
+            }
+            // SAFETY: A late mouse-up without this overlay's capture cannot finish a gesture.
+            if unsafe { GetCapture() } != hwnd {
+                finish(hwnd, state, Ok(None));
+                return LRESULT(0);
+            }
             state.selection.up(x, y);
             // SAFETY: Balance this window's mouse-down capture.
             unsafe {

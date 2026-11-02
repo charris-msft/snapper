@@ -255,7 +255,7 @@ fn record(root: &Path, seconds: u64, load: bool) -> Result<Value> {
     )
 }
 
-fn video_edge(path: &Path, start: f64, x: u32, y: u32, target: &Path) -> Result<f64> {
+pub(super) fn video_edge(path: &Path, start: f64, x: u32, y: u32, target: &Path) -> Result<f64> {
     let mut command = process::command(&process::media_tool("ffmpeg")?);
     command
         .args(["-v", "error", "-ss", &format!("{start:.3}"), "-i"])
@@ -290,7 +290,7 @@ fn video_edge(path: &Path, start: f64, x: u32, y: u32, target: &Path) -> Result<
     Ok(index as f64 / 100.0)
 }
 
-fn audio_edges(path: &Path, start: f64, target: &Path) -> Result<(f64, f64)> {
+pub(super) fn audio_edges(path: &Path, start: f64, target: &Path) -> Result<(f64, f64)> {
     let mut command = process::command(&process::media_tool("ffmpeg")?);
     command
         .args(["-v", "error", "-ss", &format!("{start:.3}"), "-i"])

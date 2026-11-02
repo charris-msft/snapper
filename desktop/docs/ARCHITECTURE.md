@@ -10,6 +10,24 @@ is used without downloading extra DXC DLLs. The active adapter and software
 fallback are reported in the UI. Image rendering/persistence and
 library/export tasks execute away from the GUI event loop.
 
+`capture` owns physical-pixel selection geometry, preferences, generation tokens
+and a per-flow atomic admission gate. `platform::selection` owns the native
+overlay, mouse capture and focus restoration. Unexpected capture loss cancels
+the gesture; ordinary release after mouse-up preserves it. Scoped Escape and
+final start admission use competing CAS operations on the same gate. A
+cancellation that wins cannot call the recording factory. If start wins, a
+concurrent signal sets that generation's unique Stop flag. Old registrations
+cannot stop a newly opened capture generation. GUI-frame polling is not the
+admission boundary.
+
+`editor::capture_ui` provides a compact launcher, source preflight and movable
+recording dock rather than embedding capture controls in the image workspace.
+Named WASAPI endpoints are validated before activation; no silent substitution
+occurs if a selected endpoint disappears. `media::preview` opens a camera only
+after an explicit Preview action, in a separately gated, Job-owned subprocess.
+Its latest-frame transport is bounded to 640x360; cancellation confirms process
+exit before a waiting recording countdown can proceed.
+
 `media::supervisor` owns a kill-on-close Windows Job Object and the media child.
 The child reads a mandatory start gate before device activation or child-process
 creation. The supervisor assigns the Job before releasing that gate. Parent
@@ -76,6 +94,23 @@ sample positions and QPC-derived sample positions are checked before converting
 only the transport timestamp to milliseconds. Native sources drain pre-origin
 samples while waiting at the common start barrier.
 
+Pause/resume boundaries and media admission have one writer-thread owner.
+The stdin thread queues a sequenced desired state; it never acknowledges a
+pause while a previous pipe write is still in flight. Acknowledgements carry
+the exact wall and media sample positions. The UI distinguishes Pausing,
+Paused and Resuming, and delayed heartbeats cannot falsely acknowledge them.
+
+Audio producers queue timestamped observations and ordered drain watermarks,
+not output packets. The writer validates each native packet once, retains its
+original wall-sample range and holds look-ahead until the wall interval is
+sealed. Both audio sources and video use the same bounded pause history.
+Only active spans reach the encoder; fully paused late packets do not conflict
+with silence commitment. Gap/overlap budgets apply to retained active samples.
+Pending PCM stays charged to the queue budget until written or discarded.
+Prepared output spans are bounded to 100 ms. Stop freezes an immutable media
+endpoint before device joins and final draining; it never waits for Resume.
+Duration limits measure active media time, not paused wall time.
+
 FFmpeg uses two encoder threads, one complex-filter thread, a two-packet input
 queue, no B frames, a finite muxing queue and a one-second mux-interleave bound.
 Third-party encoder internals and graphics-driver allocations are not claimed
@@ -92,7 +127,9 @@ Stop without going through the editor frame. Parent status merging cannot
 replace an acknowledged Stopping state with an old Recording heartbeat: the
 Stop flag is read and the heartbeat is merged while holding the same progress
 publication mutex used by Stop acknowledgement. A pre-lock snapshot is never
-used to publish the next state.
+used to publish the next state. Worker exit updates counters, folds Stop and
+persists `last-progress.json` within one critical section. Its persistence
+snapshot cannot write an older Recording state over an acknowledged Stop.
 
 The normal shutdown path releases devices before finalization. A device that
 does not release within the worker's 2.5-second wait causes worker exit. The
@@ -104,6 +141,10 @@ shutdown aborts the device-owning worker instead of relabeling it Finalizing.
 These are enforcement policies, not promises that a starved OS/driver releases
 hardware by a hard wall-clock deadline. UI acknowledgement and process/device
 exit must be measured independently.
+Pause/resume acknowledgement and in-flight media writes also have separate
+five-second wall-time watchdogs. A paused or frozen media clock cannot disable
+those deadlines. Selected devices continue draining during Pause; their state
+is explicit in the dock.
 
 The segmenter writes keyframe-aligned, independently finalized, approximately
 two-second MP4 segments. A newline-complete CSV row is not a producer-close

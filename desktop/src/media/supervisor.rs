@@ -8,7 +8,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -20,6 +20,7 @@ pub struct Recorder {
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
+    control: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
 }
 impl Recorder {
@@ -35,11 +36,13 @@ impl Recorder {
         let cancel = stop.clone();
         let done = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(AtomicU64::new(0));
+        let desired = control.clone();
         let abandon = abort.clone();
         let completed = done.clone();
         let handle = thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                supervise(&request, &state, &cancel, &abandon)
+                supervise(&request, &state, &cancel, &abandon, &desired)
             }))
             .unwrap_or_else(|_| {
                 Err(anyhow::anyhow!(
@@ -61,6 +64,7 @@ impl Recorder {
             stop,
             done,
             abort,
+            control,
             thread: Some(handle),
         }
     }
@@ -71,6 +75,53 @@ impl Recorder {
             p.phase = Phase::Stopping;
             p.detail = "Stop requested. Waiting for device release.".into();
         }
+    }
+    pub fn pause(&self) -> Result<()> {
+        self.set_paused(true)
+    }
+    pub fn resume(&self) -> Result<()> {
+        self.set_paused(false)
+    }
+    fn set_paused(&self, paused: bool) -> Result<()> {
+        let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            !self.stop.load(Ordering::Acquire),
+            "Recording is already stopping."
+        );
+        if (paused && matches!(progress.phase, Phase::Paused | Phase::Pausing))
+            || (!paused && matches!(progress.phase, Phase::Recording | Phase::Resuming))
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            matches!(
+                (paused, progress.phase),
+                (true, Phase::Recording) | (false, Phase::Paused)
+            ),
+            "Wait for the current capture transition before pausing or resuming."
+        );
+        let previous = self.control.load(Ordering::Acquire);
+        let sequence = (previous >> 1)
+            .checked_add(1)
+            .context("Pause command sequence exhausted")?;
+        anyhow::ensure!(
+            sequence <= u64::MAX >> 1,
+            "Pause command sequence exhausted."
+        );
+        self.control
+            .store((sequence << 1) | u64::from(paused), Ordering::Release);
+        progress.phase = if paused {
+            Phase::Pausing
+        } else {
+            Phase::Resuming
+        };
+        progress.detail = if paused {
+            "Pause requested. Waiting for the current media write to finish."
+        } else {
+            "Resume requested. Waiting for media admission."
+        }
+        .into();
+        Ok(())
     }
     pub fn cancel_finalization(&self) {
         self.abort.store(true, Ordering::Release);
@@ -106,18 +157,45 @@ impl Drop for Recorder {
     }
 }
 
+fn active_phase(phase: Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Starting | Phase::Recording | Phase::Pausing | Phase::Paused | Phase::Resuming
+    )
+}
+
+fn pause_timeout(start: Option<Instant>, now: Instant) -> bool {
+    start.is_some_and(|start| now.saturating_duration_since(start) > Duration::from_secs(5))
+}
+
 fn merge_progress(mut progress: Progress, stop_requested: bool) -> Progress {
-    if stop_requested && matches!(progress.phase, Phase::Starting | Phase::Recording) {
+    if stop_requested && active_phase(progress.phase) {
         progress.phase = Phase::Stopping;
         progress.detail = "Stop requested. Waiting for confirmed device release.".into();
     }
     progress
 }
 
-fn publish_progress(state: &Mutex<Progress>, stop: &AtomicBool, incoming: Progress) {
+fn publish_progress(
+    state: &Mutex<Progress>,
+    stop: &AtomicBool,
+    control: &AtomicU64,
+    incoming: Progress,
+) {
     let mut current = state.lock().unwrap_or_else(|e| e.into_inner());
     // Stop acknowledgement and heartbeat publication share this linearization point.
-    *current = merge_progress(incoming, stop.load(Ordering::Acquire));
+    let mut incoming = merge_progress(incoming, stop.load(Ordering::Acquire));
+    let requested = control.load(Ordering::Acquire);
+    if incoming.control_ack < requested >> 1 && active_phase(incoming.phase) {
+        incoming.phase = if requested & 1 != 0 {
+            Phase::Pausing
+        } else {
+            Phase::Resuming
+        };
+        incoming.detail =
+            "Waiting for the media writer to acknowledge the requested transition.".into();
+    }
+    *current = incoming;
 }
 
 fn persist_exit_progress(
@@ -132,7 +210,7 @@ fn persist_exit_progress(
     before_persist();
     // Stop, the exit snapshot and its durable publication share one boundary.
     // Never copy an earlier heartbeat back over an acknowledged Stop.
-    if stop.load(Ordering::Acquire) && matches!(current.phase, Phase::Starting | Phase::Recording) {
+    if stop.load(Ordering::Acquire) && active_phase(current.phase) {
         current.phase = Phase::Stopping;
         current.detail = "Stop requested. Waiting for confirmed device release.".into();
     }
@@ -145,6 +223,7 @@ fn supervise(
     progress: &Arc<Mutex<Progress>>,
     stop: &Arc<AtomicBool>,
     abort: &Arc<AtomicBool>,
+    control_request: &Arc<AtomicU64>,
 ) -> Result<()> {
     request.validate()?;
     anyhow::ensure!(
@@ -187,6 +266,7 @@ fn supervise(
     let latest_reader = latest.clone();
     let state = progress.clone();
     let cancel_reader = stop.clone();
+    let control_reader = control_request.clone();
     let reader = thread::spawn(move || {
         let mut reader = BufReader::new(output);
         let mut bytes = Vec::new();
@@ -198,7 +278,7 @@ fn supervise(
                 Ok(_) if bytes.len() <= 16_384 => {
                     match serde_json::from_slice::<Progress>(&bytes) {
                         Ok(p) => {
-                            publish_progress(&state, &cancel_reader, p);
+                            publish_progress(&state, &cancel_reader, &control_reader, p);
                             *latest_reader.lock().unwrap_or_else(|e| e.into_inner()) =
                                 Instant::now();
                         }
@@ -252,6 +332,8 @@ fn supervise(
     let mut finalize_time = None;
     let mut forced = None;
     let mut peak_memory = 0usize;
+    let mut sent_control = 0;
+    let mut pending_control = None;
     loop {
         peak_memory = peak_memory.max(job.peak_committed_bytes()?);
         {
@@ -294,6 +376,34 @@ fn supervise(
             return Ok(());
         }
         let p = progress.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if stop.load(Ordering::Acquire) || !active_phase(p.phase) {
+            pending_control = None;
+        } else {
+            let requested = control_request.load(Ordering::Acquire);
+            if requested != sent_control {
+                let command = format!(
+                    "{} {}\n",
+                    if requested & 1 != 0 {
+                        "pause"
+                    } else {
+                        "resume"
+                    },
+                    requested >> 1
+                );
+                if let Err(error) = control
+                    .write_all(command.as_bytes())
+                    .and_then(|_| control.flush())
+                {
+                    forced = Some(format!("Pause/resume control failed: {error}"));
+                    job.terminate()?;
+                }
+                sent_control = requested;
+                pending_control = Some(Instant::now());
+            }
+            if p.control_ack >= sent_control >> 1 {
+                pending_control = None;
+            }
+        }
         if matches!(p.phase, Phase::DevicesStopped | Phase::Finalizing) && finalize_time.is_none() {
             finalize_time = Some(Instant::now());
         }
@@ -303,8 +413,11 @@ fn supervise(
         }
         let stale =
             latest.lock().unwrap_or_else(|e| e.into_inner()).elapsed() > Duration::from_secs(5);
-        let stalled =
-            p.phase == Phase::Recording && p.elapsed_ms.saturating_sub(p.last_write_ms) > 5000;
+        let stalled = p
+            .write_started_wall_ms
+            .is_some_and(|start| p.wall_elapsed_ms.saturating_sub(start) > 5000)
+            || (p.phase == Phase::Recording
+                && p.wall_elapsed_ms.saturating_sub(p.last_write_wall_ms) > 5000);
         if (stop.load(Ordering::Acquire)
             || p.phase == Phase::Stopping
             || p.phase == Phase::Interrupted
@@ -331,11 +444,21 @@ fn supervise(
         let startup_timeout =
             p.phase == Phase::Starting && started.elapsed() > Duration::from_secs(20);
         let final_timeout = finalize_time.is_some_and(|t| t.elapsed() > Duration::from_secs(180));
-        if forced.is_none() && (timed_out || startup_timeout || final_timeout) {
+        let control_timeout = pause_timeout(pending_control, Instant::now());
+        let write_timeout = p
+            .write_started_wall_ms
+            .is_some_and(|start| p.wall_elapsed_ms.saturating_sub(start) > 5000);
+        if forced.is_none()
+            && (timed_out || startup_timeout || final_timeout || control_timeout || write_timeout)
+        {
             let stage = if startup_timeout {
                 "Device startup exceeded 20 seconds"
             } else if final_timeout {
                 "Finalization exceeded 180 seconds"
+            } else if control_timeout {
+                "Pause/resume was not acknowledged within 5 wall-clock seconds"
+            } else if write_timeout {
+                "Media pipe write exceeded 5 wall-clock seconds"
             } else {
                 "Device shutdown exceeded 5 seconds"
             };
@@ -349,6 +472,69 @@ fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delayed_heartbeats_cannot_acknowledge_pause_or_resume_and_stop_wins() {
+        let state = Mutex::new(Progress::default());
+        let stop = AtomicBool::new(false);
+        let control = AtomicU64::new(3);
+        publish_progress(
+            &state,
+            &stop,
+            &control,
+            Progress {
+                phase: Phase::Recording,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.lock().unwrap().phase, Phase::Pausing);
+        publish_progress(
+            &state,
+            &stop,
+            &control,
+            Progress {
+                phase: Phase::Paused,
+                control_ack: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.lock().unwrap().phase, Phase::Paused);
+        control.store(4, Ordering::Release);
+        publish_progress(
+            &state,
+            &stop,
+            &control,
+            Progress {
+                phase: Phase::Paused,
+                control_ack: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.lock().unwrap().phase, Phase::Resuming);
+        stop.store(true, Ordering::Release);
+        publish_progress(
+            &state,
+            &stop,
+            &control,
+            Progress {
+                phase: Phase::Recording,
+                control_ack: 2,
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.lock().unwrap().phase, Phase::Stopping);
+    }
+
+    #[test]
+    fn pending_pause_uses_a_five_second_wall_deadline_not_the_paused_clock() {
+        let start = Instant::now();
+        assert!(!pause_timeout(Some(start), start + Duration::from_secs(5)));
+        assert!(pause_timeout(
+            Some(start),
+            start + Duration::from_millis(5001)
+        ));
+        assert!(!pause_timeout(None, start + Duration::from_secs(3600)));
+    }
+
     #[test]
     fn stop_at_worker_exit_cannot_regress_visible_or_durable_progress() {
         use std::sync::Barrier;
@@ -408,13 +594,14 @@ mod tests {
             };
             reader_snapshot.wait();
             reader_release.wait();
-            publish_progress(&state, &reader_stop, incoming);
+            publish_progress(&state, &reader_stop, &AtomicU64::new(0), incoming);
         });
         let recorder = Recorder {
             progress,
             stop,
             done: Arc::new(AtomicBool::new(true)),
             abort: Arc::new(AtomicBool::new(false)),
+            control: Arc::new(AtomicU64::new(0)),
             thread: None,
         };
         snapshot_taken.wait();
@@ -428,7 +615,13 @@ mod tests {
 
     #[test]
     fn delayed_heartbeat_cannot_revert_an_acknowledged_stop() {
-        for phase in [Phase::Starting, Phase::Recording] {
+        for phase in [
+            Phase::Starting,
+            Phase::Recording,
+            Phase::Pausing,
+            Phase::Paused,
+            Phase::Resuming,
+        ] {
             let result = merge_progress(
                 Progress {
                     phase,

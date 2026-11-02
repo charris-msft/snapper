@@ -11,7 +11,14 @@ use crate::{
 };
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TargetKind {
@@ -538,6 +545,29 @@ impl Selection {
         self.drag.is_some()
     }
 
+    pub fn capture_lost(&mut self) -> bool {
+        if !self.dragging() {
+            return false;
+        }
+        self.cancel();
+        true
+    }
+
+    pub fn captured_motion(
+        &mut self,
+        x: i32,
+        y: i32,
+        button_down: bool,
+        owns_capture: bool,
+    ) -> bool {
+        if self.dragging() && (!button_down || !owns_capture) {
+            self.cancel();
+            return false;
+        }
+        self.motion(x, y);
+        !self.cancelled
+    }
+
     pub fn nudge(&mut self, dx: i32, dy: i32, resize: bool) {
         if self.cancelled || self.drag.is_some() {
             return;
@@ -571,6 +601,48 @@ impl Selection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlowToken(u64);
+
+pub struct CaptureAdmission {
+    token: FlowToken,
+    state: AtomicU8,
+    stop: Arc<AtomicBool>,
+}
+
+impl CaptureAdmission {
+    pub fn new(token: FlowToken) -> Self {
+        Self {
+            token,
+            state: AtomicU8::new(0),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    pub fn cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1
+    }
+    pub fn cancel(&self) {
+        // This CAS and admit's CAS are the shared linearization boundary. If admission
+        // already won, this signal becomes Stop for that capture's unique worker gate.
+        let _ = self
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        self.stop.store(true, Ordering::Release);
+    }
+    pub fn admit<T>(
+        &self,
+        token: FlowToken,
+        start: impl FnOnce(Arc<AtomicBool>) -> T,
+    ) -> Option<T> {
+        if self.token != token
+            || self
+                .state
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        Some(start(self.stop.clone()))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum FlowPhase {
@@ -695,6 +767,7 @@ mod tests {
                 selection.down(10, 20);
                 selection.motion(500, 600);
             }
+
             if stage >= 2 {
                 selection.up(500, 600);
             }
@@ -710,6 +783,50 @@ mod tests {
             assert!(selection.accepted().is_none());
             assert!(selection.rect.is_none());
         }
+    }
+
+    #[test]
+    fn unexpected_native_capture_loss_quarantines_all_late_pointer_events() {
+        let mut selection = Selection::new(&monitor(), None);
+        selection.down(100, 100);
+        assert!(selection.captured_motion(400, 400, true, true));
+        assert!(selection.capture_lost());
+        selection.up(900, 900);
+        assert!(!selection.captured_motion(1000, 1000, false, false));
+        assert!(selection.accepted().is_none());
+        assert!(!selection.dragging());
+        let mut fresh = Selection::new(&monitor(), None);
+        fresh.down(100, 100);
+        fresh.up(500, 500);
+        assert!(
+            !fresh.capture_lost(),
+            "Normal ReleaseCapture after mouse-up must keep the selection."
+        );
+        assert_eq!(fresh.accepted().unwrap().width, 400);
+        fresh.down(300, 300);
+        assert!(!fresh.captured_motion(400, 400, false, true));
+        assert!(fresh.accepted().is_none());
+    }
+
+    #[test]
+    fn admission_wins_then_escape_is_stop_not_a_new_capture_or_clipboard_action() {
+        let mut flow = CaptureFlow::default();
+        let token = flow.begin().unwrap();
+        let gate = CaptureAdmission::new(token);
+        let stop = gate.admit(token, |stop| stop).unwrap();
+        gate.cancel();
+        assert!(stop.load(Ordering::Acquire));
+        assert!(
+            !gate.cancelled(),
+            "Admission already won; the signal is now Stop."
+        );
+        assert!(gate.admit(token, |_| ()).is_none());
+        let next = CaptureAdmission::new(flow.begin().unwrap());
+        gate.cancel();
+        assert!(
+            !next.cancelled(),
+            "An old handler must not cancel a reopened selection."
+        );
     }
 
     #[test]

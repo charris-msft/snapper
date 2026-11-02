@@ -1,5 +1,6 @@
 mod audio_timeline;
 pub mod encoder;
+mod pause;
 pub mod preview;
 mod profile;
 mod publication;
@@ -101,20 +102,24 @@ impl Request {
         Ok(())
     }
     pub fn canvas(&self) -> (u32, u32) {
-        if !self.video {
-            return (self.area.width, self.area.height);
-        }
-        let scale = (1920.0 / self.area.width as f64)
-            .min(1080.0 / self.area.height as f64)
-            .min(1.0);
-        (
-            ((self.area.width as f64 * scale) as u32 / 2 * 2).max(2),
-            ((self.area.height as f64 * scale) as u32 / 2 * 2).max(2),
-        )
+        output_size(&self.area, self.video)
     }
     pub fn audio_count(&self) -> u8 {
         u8::from(self.sources.system_audio) + u8::from(self.sources.microphone)
     }
+}
+
+pub fn output_size(area: &Area, video: bool) -> (u32, u32) {
+    if !video {
+        return (area.width, area.height);
+    }
+    let scale = (1920.0 / area.width as f64)
+        .min(1080.0 / area.height as f64)
+        .min(1.0);
+    (
+        ((area.width as f64 * scale) as u32 / 2 * 2).max(2),
+        ((area.height as f64 * scale) as u32 / 2 * 2).max(2),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +127,9 @@ pub enum Phase {
     #[default]
     Starting,
     Recording,
+    Pausing,
+    Paused,
+    Resuming,
     Stopping,
     DevicesStopped,
     Finalizing,
@@ -142,6 +150,18 @@ pub struct Progress {
     pub detail: String,
     pub capture_id: Option<String>,
     pub last_write_ms: u64,
+    #[serde(default)]
+    pub wall_elapsed_ms: u64,
+    #[serde(default)]
+    pub last_write_wall_ms: u64,
+    #[serde(default)]
+    pub write_started_wall_ms: Option<u64>,
+    #[serde(default)]
+    pub control_ack: u64,
+    #[serde(default)]
+    pub control_wall_sample: u64,
+    #[serde(default)]
+    pub control_media_sample: u64,
     #[serde(default)]
     pub stop_requested_ms: Option<u64>,
     #[serde(default)]
@@ -203,6 +223,9 @@ pub fn entry() -> Result<()> {
             let directory=args.get(1).map(PathBuf::from)
                 .unwrap_or(std::env::current_dir()?.join("artifacts").join("fault-acceptance"));
             selftest::fault_tests(&directory)
+        },
+        Some("--pause-test") => {
+            selftest::pause_tests(&PathBuf::from(args.get(1).context("Pause acceptance directory is missing")?))
         },
         Some("--profile-test")=>{
             let directory=args.get(1).map(PathBuf::from)

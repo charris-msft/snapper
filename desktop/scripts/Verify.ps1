@@ -3,17 +3,17 @@
 param(
     [Parameter(Mandatory)][string]$PackagePath,
     [string]$EvidencePath = 'artifacts\portable-acceptance',
-    [ValidateSet('All','Media','Faults')][string]$Suite = 'All'
+    [ValidateSet('All','Media','Faults','Capture')][string]$Suite = 'All'
 )
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path "$PSScriptRoot\..").Path
 $PackagePath = [IO.Path]::GetFullPath($PackagePath, $Root)
 $EvidencePath = [IO.Path]::GetFullPath($EvidencePath, $Root)
 New-Item -ItemType Directory -Force $EvidencePath | Out-Null
-$names = if ($Suite -eq 'All') { @('Media','Faults') } else { @($Suite) }
+$names = if ($Suite -eq 'All') { @('Media','Faults','Capture') } else { @($Suite) }
 foreach ($name in $names) {
     $directory = Join-Path $EvidencePath $name.ToLowerInvariant()
-    $option = if ($name -eq 'Media') { '--self-test' } else { '--fault-test' }
+    $option = switch ($name) { 'Media' { '--self-test' } 'Faults' { '--fault-test' } 'Capture' { '--pause-test' } }
     $info = [Diagnostics.ProcessStartInfo]::new()
     $info.FileName = Join-Path $PackagePath 'snapper-desktop.exe'
     $info.ArgumentList.Add($option)

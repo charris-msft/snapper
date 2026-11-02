@@ -30,6 +30,10 @@ preview is a separate, explicit activation in a supervised process. Move/resize
 its picture-in-picture placement before capture. Only **Capture** or **Record**
 arms the configurable countdown. Screenshots never open audio sources.
 Recording uses a small movable control dock; the editor stays out of the way.
+Pause/Resume compress the same media timeline for video and both audio sources.
+Pausing keeps selected devices open and discards paused content; the dock
+states that explicitly. Stop remains available while paused or while a
+transition is pending.
 
 The image editor includes editable arrows, text, callouts, rectangles, ellipses,
 lines, original built-in stamps, connected Fill, selection/global Color
@@ -67,6 +71,11 @@ checks. Live device and GUI acceptance are separate.
 
 `--fault-test <directory>` injects generated-media-only failures, verifies
 playable recovery and confirms helper cleanup after parent death.
+`--pause-test <directory>` checks decoded pause/resume duration and A/V markers,
+Stop while paused, Stop during a stalled transition, generated-camera preview
+release and adjustable camera placement. These tests use no real private inputs.
+Use the optimized packaged candidate for media acceptance; debug codec-helper
+startup and hash checking are not a performance baseline.
 `--profile-test <directory> 600` checks an optimized 1080p generated recording
 with beginning/middle/end A/V markers over ten minutes. Its modest bounded CPU
 peer and injected video gaps do not establish arbitrary-load immunity.

@@ -1,4 +1,4 @@
-use crate::capture::{Shortcut, Shortcuts};
+use crate::capture::{CaptureAdmission, Shortcut, Shortcuts};
 use anyhow::{Context, Result};
 use std::{
     sync::{
@@ -25,6 +25,7 @@ pub struct GlobalStop {
     shutdown: Arc<AtomicBool>,
     id: Arc<AtomicU32>,
     error: Arc<Mutex<Option<String>>>,
+    target: Arc<Mutex<Option<Arc<CaptureAdmission>>>>,
     thread: Option<JoinHandle<()>>,
 }
 impl GlobalStop {
@@ -36,6 +37,7 @@ impl GlobalStop {
             key,
             MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
             "Ctrl+Shift+function key",
+            None,
             repaint,
         )
     }
@@ -50,13 +52,17 @@ impl GlobalStop {
         if shortcut.alt {
             modifiers |= MOD_ALT;
         }
-        Self::with_binding(shortcut.key, modifiers, &shortcut.label(), repaint)
+        Self::with_binding(shortcut.key, modifiers, &shortcut.label(), None, repaint)
     }
-    pub fn escape(repaint: impl Fn() + Send + 'static) -> Result<Self> {
+    pub fn escape(
+        gate: Arc<CaptureAdmission>,
+        repaint: impl Fn() + Send + 'static,
+    ) -> Result<Self> {
         Self::with_binding(
             u32::from(VK_ESCAPE.0),
             MOD_NOREPEAT,
             "Escape (active selection only)",
+            Some(gate),
             repaint,
         )
     }
@@ -64,12 +70,15 @@ impl GlobalStop {
         key: u32,
         modifiers: HOT_KEY_MODIFIERS,
         label: &str,
+        cancellation: Option<Arc<CaptureAdmission>>,
         repaint: impl Fn() + Send + 'static,
     ) -> Result<Self> {
         let flag = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let id = Arc::new(AtomicU32::new(0));
         let error = Arc::new(Mutex::new(None));
+        let target: Arc<Mutex<Option<Arc<CaptureAdmission>>>> = Arc::new(Mutex::new(None));
+        let active_target = target.clone();
         let (ready, rx) = mpsc::sync_channel(1);
         let stop = flag.clone();
         let closing = shutdown.clone();
@@ -98,8 +107,22 @@ impl GlobalStop {
                         repaint();
                         break;
                     }
+                    if closing.load(Ordering::Acquire) {
+                        break;
+                    }
                     if message.message == WM_HOTKEY && message.wParam.0 == 1 {
-                        stop.store(true, Ordering::Release);
+                        if let Some(gate) = &cancellation {
+                            gate.cancel();
+                        } else {
+                            stop.store(true, Ordering::Release);
+                            if let Some(gate) = active_target
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                            {
+                                gate.cancel();
+                            }
+                        }
                         repaint();
                     }
                 }
@@ -115,6 +138,7 @@ impl GlobalStop {
             shutdown,
             id,
             error,
+            target,
             thread: Some(handle),
         };
         rx.recv_timeout(Duration::from_secs(2)).context("Shortcut registration exceeded two seconds")?
@@ -123,6 +147,15 @@ impl GlobalStop {
     }
     pub fn take_error(&self) -> Option<String> {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+    pub fn set_target(&self, gate: Option<Arc<CaptureAdmission>>) {
+        let mut target = self.target.lock().unwrap_or_else(|e| e.into_inner());
+        if self.flag.load(Ordering::Acquire) {
+            if let Some(gate) = &gate {
+                gate.cancel();
+            }
+        }
+        *target = gate;
     }
 }
 impl Drop for GlobalStop {
@@ -181,6 +214,60 @@ impl GlobalShortcuts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delivered_cancellation_during_final_preflight_prevents_all_start_side_effects() {
+        use crate::capture::CaptureFlow;
+        use std::sync::{atomic::AtomicUsize, Barrier};
+        let mut flow = CaptureFlow::default();
+        let token = flow.begin().unwrap();
+        let gate = Arc::new(CaptureAdmission::new(token));
+        let entered_preflight = Arc::new(Barrier::new(2));
+        let finish_preflight = Arc::new(Barrier::new(2));
+        let effects = Arc::new(AtomicUsize::new(0));
+        let candidate = gate.clone();
+        let entered = entered_preflight.clone();
+        let finish = finish_preflight.clone();
+        let recorded = effects.clone();
+        let admission = thread::spawn(move || {
+            assert!(!candidate.cancelled());
+            entered.wait();
+            finish.wait();
+            candidate.admit(token, |_| {
+                recorded.fetch_add(1, Ordering::AcqRel);
+            })
+        });
+        let (delivered, received) = mpsc::sync_channel(1);
+        let hotkey = GlobalStop::with_binding(
+            0x86,
+            MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+            "test cancellation",
+            Some(gate.clone()),
+            move || {
+                let _ = delivered.send(());
+            },
+        )
+        .unwrap();
+        entered_preflight.wait();
+        // SAFETY: Deliver to the actual handler in the test-owned queue, never synthesize user input.
+        unsafe {
+            PostThreadMessageW(
+                hotkey.id.load(Ordering::Acquire),
+                WM_HOTKEY,
+                WPARAM(1),
+                LPARAM(0),
+            )
+            .unwrap();
+        }
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(gate.cancelled());
+        finish_preflight.wait();
+        assert!(admission.join().unwrap().is_none());
+        assert_eq!(
+            effects.load(Ordering::Acquire),
+            0,
+            "No worker start, source, output or clipboard action may run."
+        );
+    }
     #[test]
     fn stop_message_reaches_control_flag_without_gui_dispatch() {
         let hotkey = GlobalStop::with_key(0x87, || {}).unwrap();

@@ -1,4 +1,9 @@
-use super::{encoder, Phase, Progress, Request, TestFault};
+use super::{
+    audio_timeline::AudioTimeline,
+    encoder,
+    pause::{PauseTimeline, SAMPLE_RATE},
+    Phase, Progress, Request, TestFault,
+};
 use crate::{
     library::{self, Capture, Library},
     platform::{self, Frame},
@@ -6,9 +11,9 @@ use crate::{
 use anyhow::{bail, ensure, Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::{
-    io::BufRead,
+    io::{BufRead, Read},
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -21,6 +26,9 @@ struct Shared {
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     origin: Arc<AtomicI64>,
+    media_sample: Arc<AtomicU64>,
+    control: Arc<AtomicU64>,
+    stop_clock: Arc<AtomicI64>,
     error: Arc<Mutex<Option<String>>>,
     progress: Arc<Mutex<Progress>>,
     audio_bytes: Arc<AtomicUsize>,
@@ -41,30 +49,48 @@ impl Shared {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
     fn ms(&self) -> u64 {
+        self.media_sample.load(Ordering::Acquire) / 48
+    }
+    fn wall_sample(&self) -> Result<u64> {
         let origin = self.origin.load(Ordering::Acquire);
         if origin == 0 {
-            return 0;
+            return Ok(0);
         }
-        match platform::clock_100ns() {
-            Ok(t) => ((t - origin).max(0) / 10_000) as u64,
-            Err(error) => {
-                self.fail(format!("Monotonic media clock failed: {error:#}"));
-                0
-            }
-        }
+        Ok(
+            ((i128::from(platform::clock_100ns()?) - i128::from(origin)).max(0)
+                * i128::from(SAMPLE_RATE)
+                / 10_000_000) as u64,
+        )
+    }
+    fn wall_ms(&self) -> Result<u64> {
+        Ok(self.wall_sample()? / 48)
     }
 }
-struct AudioPacket {
-    index: u8,
-    ms: u64,
-    pcm: Vec<u8>,
+enum AudioEvent {
+    Packet {
+        index: u8,
+        packet: platform::audio::Packet,
+        observed: i64,
+    },
+    Drained {
+        index: u8,
+        observed: i64,
+    },
+}
+impl AudioEvent {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Packet { packet, .. } => packet.pcm.len(),
+            Self::Drained { .. } => 0,
+        }
+    }
 }
 struct Devices {
     shared: Shared,
     threads: Vec<JoinHandle<()>>,
     screen: FrameSlot,
     camera: FrameSlot,
-    audio: Receiver<AudioPacket>,
+    audio: Receiver<AudioEvent>,
 }
 fn spawn_device(
     shared: &Shared,
@@ -112,7 +138,7 @@ impl Devices {
                     let frame = synthetic_frame(
                         req.area.width,
                         req.area.height,
-                        state.ms(),
+                        state.wall_ms()?,
                         req.sources.cursor,
                         false,
                     )?;
@@ -149,7 +175,7 @@ impl Devices {
                     *camera.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(frame));
                     ready.send(())?;
                     while !state.stop.load(Ordering::Acquire) {
-                        let frame = synthetic_frame(320, 180, state.ms(), false, true)?;
+                        let frame = synthetic_frame(320, 180, state.wall_ms()?, false, true)?;
                         *camera.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(frame));
                         state.update(|p| p.camera_frames += 1);
                         thread::sleep(Duration::from_millis(33));
@@ -255,37 +281,30 @@ impl Devices {
                         return Ok(());
                     }
                     let origin = state.origin.load(Ordering::Acquire);
-                    let mut timeline = super::audio_timeline::AudioTimeline::new(system, origin);
                     let mut next_frame = 0u64;
+                    let mut last_packet = Instant::now();
+                    let mut next_drained = Instant::now();
                     while !state.stop.load(Ordering::Acquire) {
                         if let Some(native) = native.as_ref() {
                             while let Some(packet) = native.packet()? {
-                                let plan = timeline.packet(packet, platform::clock_100ns()?)?;
-                                state.update(|p| {
-                                    p.audio_silence_frames += plan.silence_frames;
-                                    p.audio_discontinuities += u64::from(plan.discontinuity);
-                                });
-                                for chunk in plan.chunks {
-                                    send_audio(
-                                        &state,
-                                        &tx,
-                                        this_index,
-                                        chunk.sample / 48,
-                                        chunk.pcm,
-                                    )?;
-                                }
+                                last_packet = Instant::now();
+                                send_audio(
+                                    &state,
+                                    &tx,
+                                    AudioEvent::Packet {
+                                        index: this_index,
+                                        packet,
+                                        observed: platform::clock_100ns()?,
+                                    },
+                                )?;
                                 if state.stop.load(Ordering::Acquire) {
                                     break;
                                 }
                             }
-                            if let Some(chunk) = timeline.idle(platform::clock_100ns()?)? {
-                                state.update(|p| {
-                                    p.audio_silence_frames += chunk.pcm.len() as u64 / 4
-                                });
-                                send_audio(&state, &tx, this_index, chunk.sample / 48, chunk.pcm)?;
-                            }
+                            ensure!(system || last_packet.elapsed() <= Duration::from_secs(1),
+                                "The selected microphone stopped delivering packets for 1 second, including while paused.");
                         } else {
-                            let due = state.ms() * 48;
+                            let due = state.wall_sample()?;
                             while next_frame + 480 <= due {
                                 let mut pcm = Vec::with_capacity(1920);
                                 let frequency = if system { 440.0 } else { 880.0 };
@@ -307,9 +326,37 @@ impl Devices {
                                     pcm.extend(value.to_le_bytes());
                                     pcm.extend(value.to_le_bytes());
                                 }
-                                send_audio(&state, &tx, this_index, next_frame / 48, pcm)?;
+                                send_audio(
+                                    &state,
+                                    &tx,
+                                    AudioEvent::Packet {
+                                        index: this_index,
+                                        observed: platform::clock_100ns()?,
+                                        packet: platform::audio::Packet {
+                                            timestamp: origin
+                                                + (i128::from(next_frame) * 10_000_000
+                                                    / i128::from(SAMPLE_RATE))
+                                                    as i64,
+                                            device_position: next_frame,
+                                            frames: 480,
+                                            pcm,
+                                            discontinuity: false,
+                                        },
+                                    },
+                                )?;
                                 next_frame += 480;
                             }
+                        }
+                        if Instant::now() >= next_drained {
+                            send_audio(
+                                &state,
+                                &tx,
+                                AudioEvent::Drained {
+                                    index: this_index,
+                                    observed: platform::clock_100ns()?,
+                                },
+                            )?;
+                            next_drained = Instant::now() + Duration::from_millis(50);
                         }
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -362,23 +409,197 @@ impl Drop for Devices {
     }
 }
 
-fn send_audio(
-    state: &Shared,
-    tx: &Sender<AudioPacket>,
-    index: u8,
-    ms: u64,
-    pcm: Vec<u8>,
-) -> Result<()> {
-    let bytes = pcm.len();
+fn send_audio(state: &Shared, tx: &Sender<AudioEvent>, event: AudioEvent) -> Result<()> {
+    let bytes = event.bytes();
     let previous = state.audio_bytes.fetch_add(bytes, Ordering::AcqRel);
     if previous + bytes > state.audio_limit {
         state.audio_bytes.fetch_sub(bytes, Ordering::AcqRel);
         bail!("The bounded two-seconds-per-source audio queue is full. Capture stopped rather than growing memory or dropping audio.");
     }
     state.update(|p| p.peak_audio_queue_bytes = p.peak_audio_queue_bytes.max(previous + bytes));
-    if let Err(e) = tx.try_send(AudioPacket { index, ms, pcm }) {
+    if let Err(e) = tx.try_send(event) {
         state.audio_bytes.fetch_sub(bytes, Ordering::AcqRel);
         bail!("Bounded audio channel cannot accept a packet: {e}");
+    }
+    Ok(())
+}
+
+fn read_controls(state: &Shared) -> Result<()> {
+    let input = std::io::stdin();
+    let mut reader = input.lock();
+    loop {
+        let mut line = String::new();
+        if (&mut reader).take(65).read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        ensure!(
+            line.len() <= 64 && line.ends_with('\n'),
+            "Media command exceeded its 64-byte budget."
+        );
+        let line = line.trim_end_matches('\n');
+        if line == "stop" {
+            let now = platform::clock_100ns()?;
+            let _ = state
+                .stop_clock
+                .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+            state.stop.store(true, Ordering::Release);
+            let wall = state.wall_ms()?;
+            state.update(|p| {
+                p.stop_requested_ms = Some(wall);
+                if matches!(
+                    p.phase,
+                    Phase::Starting
+                        | Phase::Recording
+                        | Phase::Pausing
+                        | Phase::Paused
+                        | Phase::Resuming
+                ) {
+                    p.phase = Phase::Stopping;
+                    p.detail = "Stop received by the media control thread.".into();
+                }
+            });
+            return Ok(());
+        }
+        let (command, sequence) = line
+            .split_once(' ')
+            .context("Invalid media control command")?;
+        ensure!(
+            command == "pause" || command == "resume",
+            "Unknown media control command."
+        );
+        let sequence: u64 = sequence.parse()?;
+        ensure!(
+            sequence > 0 && sequence <= u64::MAX >> 1,
+            "Invalid media control sequence."
+        );
+        let next = (sequence << 1) | u64::from(command == "pause");
+        let previous = state.control.load(Ordering::Acquire);
+        ensure!(
+            sequence > previous >> 1 || next == previous,
+            "Stale or conflicting media control sequence."
+        );
+        state.control.store(next, Ordering::Release);
+    }
+}
+
+fn apply_control(
+    state: &Shared,
+    clock: &mut PauseTimeline,
+    wall: u64,
+    applied: &mut u64,
+) -> Result<()> {
+    if state.stop.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let requested = state.control.load(Ordering::Acquire);
+    if requested == *applied {
+        return Ok(());
+    }
+    let paused = requested & 1 != 0;
+    clock.set_paused(wall, paused)?;
+    *applied = requested;
+    state
+        .media_sample
+        .store(clock.media_at(wall), Ordering::Release);
+    state.update(|p| {
+        if !state.stop.load(Ordering::Acquire) {
+            p.phase = if paused {
+                Phase::Paused
+            } else {
+                Phase::Recording
+            };
+            p.detail = if paused {
+                "Paused. Selected devices remain on; paused pixels and audio are excluded."
+            } else {
+                "Recording resumed on the same media timeline."
+            }
+            .into();
+        }
+        p.control_ack = requested >> 1;
+        p.control_wall_sample = wall;
+        p.control_media_sample = clock.media_at(wall);
+        p.last_write_wall_ms = wall / 48;
+    });
+    Ok(())
+}
+
+fn write_media(state: &Shared, write: impl FnOnce() -> Result<()>) -> Result<()> {
+    let started = state.wall_ms()?;
+    state.update(|p| p.write_started_wall_ms = Some(started));
+    let result = write();
+    let finished = state.wall_ms()?;
+    state.update(|p| {
+        p.write_started_wall_ms = None;
+        if result.is_ok() {
+            p.last_write_wall_ms = finished;
+        }
+    });
+    result
+}
+
+fn receive_audio(devices: &Devices, timelines: &mut [AudioTimeline], state: &Shared) -> Result<()> {
+    for _ in 0..512 {
+        let event = match devices.audio.try_recv() {
+            Ok(event) => event,
+            Err(crossbeam_channel::TryRecvError::Empty) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                ensure!(
+                    timelines.is_empty() || state.stop.load(Ordering::Acquire),
+                    "Selected audio sources closed their channel before Stop."
+                );
+                break;
+            }
+        };
+        let (index, packet, observed) = match event {
+            AudioEvent::Packet {
+                index,
+                packet,
+                observed,
+            } => (index, Some(packet), observed),
+            AudioEvent::Drained { index, observed } => (index, None, observed),
+        };
+        let timeline = timelines
+            .get_mut(index as usize)
+            .context("Audio event has an unselected source index")?;
+        if let Some(packet) = packet {
+            let discontinuity = timeline.observe(packet, observed)?;
+            state.update(|p| p.audio_discontinuities += u64::from(discontinuity));
+        } else {
+            timeline.observe_drained(observed)?;
+        }
+        state
+            .audio_bytes
+            .fetch_sub(timeline.take_released_bytes(), Ordering::AcqRel);
+    }
+    Ok(())
+}
+
+fn admit_audio(
+    timelines: &mut [AudioTimeline],
+    clock: &PauseTimeline,
+    sealed_wall: u64,
+    media_limit: u64,
+    final_drain: bool,
+    encoder: &mut encoder::Encoder,
+    state: &Shared,
+) -> Result<()> {
+    for (index, timeline) in timelines.iter_mut().enumerate() {
+        let budget = if final_drain { usize::MAX } else { 32 };
+        for _ in 0..budget {
+            let prepared = timeline.prepare_next(clock, sealed_wall, media_limit, final_drain)?;
+            state
+                .audio_bytes
+                .fetch_sub(timeline.take_released_bytes(), Ordering::AcqRel);
+            let Some(prepared) = prepared else { break };
+            write_media(state, || {
+                encoder.audio(index as u8, prepared.sample / 48, &prepared.pcm)
+            })?;
+            timeline.commit(&prepared)?;
+            state
+                .audio_bytes
+                .fetch_sub(timeline.take_released_bytes(), Ordering::AcqRel);
+            state.update(|p| p.audio_silence_frames += prepared.silence_frames);
+        }
     }
     Ok(())
 }
@@ -414,6 +635,9 @@ pub fn run(request: Request) -> Result<()> {
         stop: Arc::new(AtomicBool::new(false)),
         finished: Arc::new(AtomicBool::new(false)),
         origin: Arc::new(AtomicI64::new(0)),
+        media_sample: Arc::new(AtomicU64::new(0)),
+        control: Arc::new(AtomicU64::new(0)),
+        stop_clock: Arc::new(AtomicI64::new(0)),
         error: Arc::new(Mutex::new(None)),
         progress: Arc::new(Mutex::new(Progress {
             detail: encoder::source_description(&request.sources),
@@ -424,38 +648,44 @@ pub fn run(request: Request) -> Result<()> {
     };
     let state = shared.clone();
     thread::spawn(move || {
-        if let Some(line) = std::io::stdin().lock().lines().next() {
-            match line {
-                Ok(line) if line == "stop" => {
-                    state.stop.store(true, Ordering::Release);
-                    let ms = state.ms();
-                    state.update(|p| {
-                        p.stop_requested_ms = Some(ms);
-                        if matches!(p.phase, Phase::Starting | Phase::Recording) {
-                            p.phase = Phase::Stopping;
-                            p.detail = "Stop received by the media control thread.".into();
-                        }
-                    });
-                }
-                Ok(_) => {
-                    state.fail("Invalid media control command.".into());
-                }
-                Err(e) => {
-                    state.fail(format!("Media control channel failed: {e}"));
-                }
+        let result = read_controls(&state);
+        if let Err(error) = result {
+            state.fail(format!("Media control channel: {error:#}"));
+        }
+        match platform::clock_100ns() {
+            Ok(clock) => {
+                let _ = state.stop_clock.compare_exchange(
+                    0,
+                    clock,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
             }
+            Err(error) => state.fail(format!("Stop clock failed: {error:#}")),
         }
         state.stop.store(true, Ordering::Release);
     });
     let state = shared.clone();
     let heartbeat = thread::spawn(move || {
         while !state.finished.load(Ordering::Acquire) {
+            let wall = state.wall_ms();
+            if let Err(error) = &wall {
+                state.fail(format!("Heartbeat clock failed: {error:#}"));
+            }
             state.update(|p| {
                 if matches!(
                     p.phase,
-                    Phase::Starting | Phase::Recording | Phase::Stopping
+                    Phase::Starting
+                        | Phase::Recording
+                        | Phase::Pausing
+                        | Phase::Paused
+                        | Phase::Resuming
+                        | Phase::Stopping
                 ) {
                     p.elapsed_ms = state.ms();
+                }
+                if let Ok(wall) = wall {
+                    p.wall_elapsed_ms = wall;
                 }
             });
             let progress = state
@@ -549,8 +779,9 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
             p.detail = "Screenshot captured; releasing devices.".into();
         });
         devices.stop()?;
+        let stopped = shared.wall_ms()?;
         shared.update(|p| {
-            p.devices_stopped_ms = Some(shared.ms());
+            p.devices_stopped_ms = Some(stopped);
             p.phase = Phase::Finalizing;
             p.detail = "Saving screenshot locally.".into();
         });
@@ -577,6 +808,17 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
     shared
         .origin
         .store(platform::clock_100ns()?, Ordering::Release);
+    let origin = shared.origin.load(Ordering::Acquire);
+    let mut audio_timelines = Vec::new();
+    if request.sources.system_audio {
+        audio_timelines.push(AudioTimeline::new(true, origin));
+    }
+    if request.sources.microphone {
+        audio_timelines.push(AudioTimeline::new(false, origin));
+    }
+    let mut clock = PauseTimeline::default();
+    let mut applied_control = 0;
+    let media_limit = request.max_seconds * SAMPLE_RATE;
     let (width, height) = request.canvas();
     let mut output = vec![0; width as usize * height as usize * 4];
     let mut next_tick = 0;
@@ -607,7 +849,13 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
         let mut last_disk_check = Instant::now();
         let mut next_jitter = 5000;
         while !shared.stop.load(Ordering::Acquire) {
-            let ms = shared.ms();
+            let wall = shared.wall_sample()?;
+            // This loop is the only media-admission and pause-boundary owner. No native
+            // acquisition thread can commit output or acknowledge a transition.
+            apply_control(shared, &mut clock, wall, &mut applied_control)?;
+            let sample = clock.media_at(wall).min(media_limit);
+            shared.media_sample.store(sample, Ordering::Release);
+            let ms = sample / 48;
             if request.test_fault == Some(TestFault::VideoDeliveryJitter) && ms >= next_jitter {
                 thread::sleep(Duration::from_millis(180));
                 next_jitter = ms + 5000;
@@ -630,17 +878,27 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
                 }
             }
             if ms >= request.max_seconds * 1000 {
+                clock.freeze(clock.wall_at(media_limit));
                 break;
             }
-            while let Ok(packet) = devices.audio.try_recv() {
-                shared
-                    .audio_bytes
-                    .fetch_sub(packet.pcm.len(), Ordering::AcqRel);
-                encoder.audio(packet.index, packet.ms, &packet.pcm)?;
-            }
-            let ms = shared.ms();
-            let tick = ms * 30 / 1000;
-            if tick >= next_tick {
+            receive_audio(&devices, &mut audio_timelines, shared)?;
+            admit_audio(
+                &mut audio_timelines,
+                &clock,
+                wall,
+                media_limit,
+                false,
+                &mut encoder,
+                shared,
+            )?;
+            let video_sample = clock.media_at(shared.wall_sample()?);
+            let video_ms = video_sample / 48;
+            let tick = video_ms * 30 / 1000;
+            if !clock.paused()
+                && video_sample < media_limit
+                && tick >= next_tick
+                && !shared.stop.load(Ordering::Acquire)
+            {
                 let screen = devices
                     .screen
                     .lock()
@@ -668,12 +926,12 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
                     &mut output,
                     request.pip,
                 );
-                encoder.video(tick * 1000 / 30, &output)?;
+                write_media(shared, || encoder.video(tick * 1000 / 30, &output))?;
                 shared.update(|p| {
                     p.frames += 1;
                     p.repeated += u64::from(repeated);
                     p.skipped += tick.saturating_sub(next_tick);
-                    p.last_write_ms = ms;
+                    p.last_write_ms = video_ms;
                 });
                 next_tick = tick + 1;
             }
@@ -687,9 +945,27 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
         }
         Ok(())
     })();
+    if clock.frozen().is_none() {
+        let stopped = shared.stop_clock.load(Ordering::Acquire);
+        let wall = if stopped != 0 {
+            ((i128::from(stopped) - i128::from(origin)).max(0) * i128::from(SAMPLE_RATE)
+                / 10_000_000) as u64
+        } else {
+            shared.wall_sample()?
+        };
+        clock.freeze(wall.min(clock.wall_at(media_limit)));
+    }
+    let final_wall = clock
+        .frozen()
+        .context("Final media endpoint was not frozen")?;
+    shared.media_sample.store(
+        clock.media_at(final_wall).min(media_limit),
+        Ordering::Release,
+    );
+    let stop_ms = shared.wall_ms()?;
     shared.update(|p| {
         p.phase = Phase::Stopping;
-        p.stop_requested_ms.get_or_insert(shared.ms());
+        p.stop_requested_ms.get_or_insert(stop_ms);
         p.detail = "Releasing selected capture devices.".into();
     });
     let device_result = devices.stop();
@@ -703,8 +979,9 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
             .context("Device release was not confirmed; the media process is exiting.");
     }
     if device_result.is_ok() {
+        let stopped = shared.wall_ms()?;
         shared.update(|p| {
-            p.devices_stopped_ms = Some(shared.ms());
+            p.devices_stopped_ms = Some(stopped);
             p.elapsed_ms = shared.ms();
             p.phase = Phase::DevicesStopped;
             p.detail = "Devices released; finalizing media.".into();
@@ -714,14 +991,23 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
         super::mark_fault(request, TestFault::FinalDrainStall)?;
         thread::sleep(Duration::from_secs(60));
     }
-    while let Ok(packet) = devices.audio.try_recv() {
+    if let Err(error) = receive_audio(&devices, &mut audio_timelines, shared).and_then(|_| {
+        admit_audio(
+            &mut audio_timelines,
+            &clock,
+            final_wall,
+            media_limit,
+            true,
+            &mut encoder,
+            shared,
+        )
+    }) {
+        shared.fail(format!("Final audio admission: {error:#}"));
+    }
+    for timeline in &mut audio_timelines {
         shared
             .audio_bytes
-            .fetch_sub(packet.pcm.len(), Ordering::AcqRel);
-        if let Err(e) = encoder.audio(packet.index, packet.ms, &packet.pcm) {
-            shared.fail(format!("Final audio packet: {e:#}"));
-            break;
-        }
+            .fetch_sub(timeline.discard_pending(), Ordering::AcqRel);
     }
     shared.update(|p| {
         p.phase = Phase::Finalizing;
@@ -854,6 +1140,61 @@ pub fn synthetic_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pause_acknowledgement_waits_for_inflight_write_and_stop_can_preempt_it() {
+        use std::sync::Barrier;
+        for stop_during_write in [false, true] {
+            let shared = Shared {
+                stop: Arc::new(AtomicBool::new(false)),
+                finished: Arc::new(AtomicBool::new(false)),
+                origin: Arc::new(AtomicI64::new(platform::clock_100ns().unwrap())),
+                media_sample: Arc::new(AtomicU64::new(0)),
+                control: Arc::new(AtomicU64::new(0)),
+                stop_clock: Arc::new(AtomicI64::new(0)),
+                error: Arc::new(Mutex::new(None)),
+                progress: Arc::new(Mutex::new(Progress {
+                    phase: Phase::Recording,
+                    ..Default::default()
+                })),
+                audio_bytes: Arc::new(AtomicUsize::new(0)),
+                audio_limit: 384_000,
+            };
+            let writing = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let state = shared.clone();
+            let entered = writing.clone();
+            let resume = release.clone();
+            let worker = thread::spawn(move || {
+                let mut clock = PauseTimeline::default();
+                write_media(&state, || {
+                    entered.wait();
+                    resume.wait();
+                    Ok(())
+                })
+                .unwrap();
+                apply_control(&state, &mut clock, state.wall_sample().unwrap(), &mut 0).unwrap();
+                clock.paused()
+            });
+            writing.wait();
+            shared.control.store(3, Ordering::Release);
+            assert_eq!(shared.progress.lock().unwrap().control_ack, 0);
+            assert!(shared
+                .progress
+                .lock()
+                .unwrap()
+                .write_started_wall_ms
+                .is_some());
+            if stop_during_write {
+                shared.stop.store(true, Ordering::Release);
+            }
+            release.wait();
+            assert_eq!(worker.join().unwrap(), !stop_during_write);
+            let progress = shared.progress.lock().unwrap();
+            assert_eq!(progress.control_ack, u64::from(!stop_during_write));
+            assert!(progress.write_started_wall_ms.is_none());
+        }
+    }
+
     #[test]
     fn camera_epoch_mapping_and_regression() {
         let mut c = CameraClock::default();

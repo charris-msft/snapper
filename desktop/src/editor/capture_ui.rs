@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     capture::{
-        CaptureFlow, CaptureOptions, Destination, FlowPhase, FlowToken, PixelRect, Preferences,
-        Preset, RememberedRegion, Shortcuts, TargetKind,
+        CaptureAdmission, CaptureFlow, CaptureOptions, Destination, FlowPhase, FlowToken,
+        PixelRect, Preferences, Preset, RememberedRegion, Shortcuts, TargetKind,
     },
     media::{preview::CameraPreview, Request},
     platform::{
@@ -22,6 +22,7 @@ pub(super) struct CaptureUi {
     settings: bool,
     hotkeys: Option<GlobalShortcuts>,
     escape: Option<GlobalStop>,
+    admission: Option<Arc<CaptureAdmission>>,
     overlay: Option<Overlay>,
     previous_focus: Option<Foreground>,
     monitors: Vec<Monitor>,
@@ -79,6 +80,7 @@ impl CaptureUi {
             launcher: true,
             settings: false,
             escape: None,
+            admission: None,
             overlay: None,
             previous_focus: None,
             monitors,
@@ -219,18 +221,28 @@ impl Editor {
             };
             if !self.capture_ui.flow.active() {
                 self.capture_ui.previous_focus = Some(Foreground::remember());
-                let context = ctx.clone();
-                let window = self.window_handle;
-                self.capture_ui.escape = Some(GlobalStop::escape(move || {
-                    if let Err(error) = platform::process::restore_owned_window(window) {
-                        eprintln!("Cancellation window restore: {error:#}");
-                    }
-                    context.request_repaint();
-                })?);
             }
+            if let Some(previous) = self.capture_ui.admission.take() {
+                previous.cancel();
+            }
+            self.capture_ui.escape = None;
             self.capture_ui.monitors = monitors;
             self.capture_ui.flow_monitor = Some(monitor.clone());
             let token = self.capture_ui.flow.begin()?;
+            let gate = Arc::new(CaptureAdmission::new(token));
+            self.capture_ui.admission = Some(gate.clone());
+            if let Some(keys) = &self.capture_ui.hotkeys {
+                keys.stop.flag.store(false, Ordering::Release);
+                keys.stop.set_target(Some(gate.clone()));
+            }
+            let context = ctx.clone();
+            let window = self.window_handle;
+            self.capture_ui.escape = Some(GlobalStop::escape(gate, move || {
+                if let Err(error) = platform::process::restore_owned_window(window) {
+                    eprintln!("Cancellation window restore: {error:#}");
+                }
+                context.request_repaint();
+            })?);
             let target = self.capture_ui.preferences.capture.target;
             if let Some(area) = repeated {
                 self.capture_ui.area = area.clone();
@@ -286,6 +298,12 @@ impl Editor {
 
     pub(super) fn cancel_capture_flow(&mut self, ctx: &egui::Context) {
         // Invalidate the ticket before disposing native resources or processing any queued event.
+        if let Some(gate) = self.capture_ui.admission.take() {
+            gate.cancel();
+        }
+        if let Some(keys) = &self.capture_ui.hotkeys {
+            keys.stop.set_target(None);
+        }
         self.capture_ui.flow.cancel();
         self.capture_ui.pending_arm = None;
         self.capture_ui.overlay = None;
@@ -392,7 +410,7 @@ impl Editor {
         ctx.request_repaint();
     }
 
-    fn start_selected(&mut self, ctx: &egui::Context, area: Area) {
+    fn start_selected(&mut self, ctx: &egui::Context, token: FlowToken, area: Area) {
         let options = self.capture_ui.preferences.capture.clone();
         let request = Request {
             schema: 1,
@@ -410,39 +428,57 @@ impl Editor {
             test_fault: None,
         };
         if !self.capture_notice(request.validate()) {
+            self.cancel_capture_flow(ctx);
             return;
         }
+        if !self.save_preferences() {
+            self.cancel_capture_flow(ctx);
+            return;
+        }
+        let Some(gate) = self.capture_ui.admission.clone() else {
+            self.cancel_capture_flow(ctx);
+            self.error = Some("Capture admission ticket is missing. Nothing was started.".into());
+            return;
+        };
+        let started = gate.admit(token, |stop| -> Result<Recorder> {
+            ensure!(
+                self.capture_ui
+                    .flow
+                    .take_start(token, Instant::now())
+                    .is_some(),
+                "Capture ticket changed before admission. Nothing was started."
+            );
+            if options.video {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(380.0, 100.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(400.0, 118.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    egui::WindowLevel::AlwaysOnTop,
+                ));
+            } else {
+                selection::hide_owned(self.window_handle)?;
+                self.hide_for_capture = true;
+            }
+            Ok(Recorder::start_with_stop(request, stop))
+        });
+        match started {
+            Some(Ok(recorder)) => self.recorder = Some(recorder),
+            Some(Err(error)) => {
+                self.cancel_capture_flow(ctx);
+                self.error = Some(format!("{error:#}"));
+                return;
+            }
+            None => {
+                self.cancel_capture_flow(ctx);
+                return;
+            }
+        }
+        // The scoped handler remains wired until the admitted recorder owns the same Stop flag.
         self.capture_ui.escape = None;
         self.capture_ui.overlay = None;
         self.capture_ui.previous_focus = None;
-        if let Some(monitor) = self.capture_ui.flow_monitor.clone() {
-            self.capture_ui.preferences.last_region = Some(RememberedRegion { monitor, area });
-        }
-        if !self.save_preferences() {
-            self.show_launcher(ctx);
-            return;
-        }
-        if options.video {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(Vec2::new(380.0, 100.0)));
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(400.0, 118.0)));
-            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                egui::WindowLevel::AlwaysOnTop,
-            ));
-        } else {
-            if !self.capture_notice(selection::hide_owned(self.window_handle)) {
-                return;
-            }
-            self.hide_for_capture = true;
-        }
         self.capture_ui.active_options = Some(options.clone());
-        self.recorder = Some(if let Some(keys) = &self.capture_ui.hotkeys {
-            keys.stop.flag.store(false, Ordering::Release);
-            Recorder::start_with_stop(request, keys.stop.flag.clone())
-        } else {
-            Recorder::start(request)
-        });
         if !options.video {
             let completed = self.recorder.as_ref().unwrap().completion_signal();
             let window = self.window_handle;
@@ -463,7 +499,18 @@ impl Editor {
 
     pub(super) fn capture_finished(&mut self, ctx: &egui::Context, progress: &Progress) {
         if let Some(keys) = &self.capture_ui.hotkeys {
+            keys.stop.set_target(None);
             keys.stop.flag.store(false, Ordering::Release);
+        }
+        self.capture_ui.admission = None;
+        if progress.phase == Phase::Saved {
+            if let Some(monitor) = self.capture_ui.flow_monitor.clone() {
+                self.capture_ui.preferences.last_region = Some(RememberedRegion {
+                    monitor,
+                    area: self.capture_ui.area.clone(),
+                });
+                self.save_preferences();
+            }
         }
         if let (Some(id), Some(options)) =
             (&progress.capture_id, self.capture_ui.active_options.take())
@@ -554,7 +601,12 @@ impl Editor {
         }
         cancel |= self.capture_ui.flow.active()
             && ctx.input(|input| input.key_pressed(egui::Key::Escape));
-        if cancel {
+        cancel |= self
+            .capture_ui
+            .admission
+            .as_ref()
+            .is_some_and(|gate| gate.cancelled());
+        if cancel && self.capture_ui.flow.active() {
             self.cancel_capture_flow(ctx);
         } else if (capture || repeat) && !self.capture_ui.flow.active() && self.recorder.is_none() {
             self.begin_capture(ctx, repeat);
@@ -649,8 +701,8 @@ impl Editor {
                 if let Err(error) = self.validate_preflight() {
                     self.cancel_capture_flow(ctx);
                     self.error = Some(format!("{error:#}"));
-                } else if let Some(area) = self.capture_ui.flow.take_start(token, Instant::now()) {
-                    self.start_selected(ctx, area);
+                } else if let FlowPhase::Countdown { area, .. } = &self.capture_ui.flow.phase {
+                    self.start_selected(ctx, token, area.clone());
                 }
             }
         }
@@ -906,10 +958,24 @@ impl Editor {
             "Ready to capture"
         });
         let area = self.capture_ui.area.clone();
+        let output = media::output_size(&area, self.capture_ui.preferences.capture.video);
         ui.label(format!(
             "{} x {} physical pixels at {}, {} on {}",
             area.width, area.height, area.x, area.y, area.monitor
         ));
+        if self.capture_ui.preferences.capture.video {
+            ui.label(
+                RichText::new(format!("Output: {} x {} at 30 fps", output.0, output.1)).strong(),
+            );
+            if output != (area.width, area.height) {
+                ui.label(
+                    "The selected source is scaled to the current 1920 x 1080 recording envelope.",
+                );
+            }
+            ui.small(
+                "H.264 software encoding (libx264). Hardware encoding is not selected or claimed.",
+            );
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new("Esc to cancel").strong());
             if ui
@@ -1343,6 +1409,23 @@ impl Editor {
                     ));
                     ui.label(format!("{:?}", self.last_progress.phase));
                     if let Some(recorder) = &self.recorder {
+                        if self.last_progress.phase == Phase::Paused {
+                            if ui.button("Resume").clicked() {
+                                if let Err(error) = recorder.resume() {
+                                    self.error = Some(format!("{error:#}"));
+                                }
+                            }
+                        } else if ui
+                            .add_enabled(
+                                self.last_progress.phase == Phase::Recording,
+                                egui::Button::new("Pause"),
+                            )
+                            .clicked()
+                        {
+                            if let Err(error) = recorder.pause() {
+                                self.error = Some(format!("{error:#}"));
+                            }
+                        }
                         if matches!(
                             self.last_progress.phase,
                             Phase::DevicesStopped | Phase::Finalizing
@@ -1356,10 +1439,14 @@ impl Editor {
                     }
                 });
                 ui.small(&self.last_progress.detail);
-                ui.small(format!(
-                    "Stop anywhere: {}  |  Controls excluded from capture",
-                    self.capture_ui.preferences.shortcuts.stop
-                ));
+                ui.small(if self.capture_ui.hotkeys.is_some() {
+                    format!(
+                        "Stop anywhere: {}  |  Controls excluded from capture",
+                        self.capture_ui.preferences.shortcuts.stop
+                    )
+                } else {
+                    "Global shortcuts unavailable. Use Stop. Controls excluded from capture.".into()
+                });
             });
     }
 }

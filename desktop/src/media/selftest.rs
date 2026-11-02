@@ -92,6 +92,323 @@ pub fn run(root: &Path) -> Result<()> {
     );
     Ok(())
 }
+pub fn pause_tests(root: &Path) -> Result<()> {
+    let root = if root.is_absolute() {
+        root.to_owned()
+    } else {
+        std::env::current_dir()?.join(root)
+    };
+    fs::create_dir_all(&root)?;
+    let run = root.join(format!("run-{}", library::id()));
+    fs::create_dir(&run)?;
+    let mut cases = Vec::new();
+    for (name, mask, stop_paused) in [
+        ("pause-resume-all-sources", 15, false),
+        ("pause-resume-no-optional-sources", 0, false),
+        ("stop-while-paused", 12, true),
+    ] {
+        let result = pause_capture(&run.join(name), mask, stop_paused);
+        cases.push(acceptance_case(name, result));
+        library::write_json(&run.join("results.json"), &cases)?;
+    }
+    for (name, result) in [
+        (
+            "pause-stalled-writer-then-stop",
+            pause_stalled_writer(&run.join("stalled-writer")),
+        ),
+        ("generated-camera-preview-release", generated_preview()),
+        ("adjustable-camera-placement", pip_capture(&run.join("pip"))),
+    ] {
+        cases.push(acceptance_case(name, result));
+        library::write_json(&run.join("results.json"), &cases)?;
+    }
+    let passed = cases.iter().filter(|case| case.passed).count();
+    let summary = json!({
+        "kind":"synthetic-pause-and-capture-acceptance", "passed":passed, "total":cases.len(),
+        "results":run.join("results.json"), "build":build_identity()?,
+        "real_screen_tested":false, "real_camera_tested":false, "real_microphone_tested":false,
+    });
+    library::write_json(&root.join("latest.json"), &summary)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    ensure!(
+        passed == cases.len(),
+        "{passed}/{} pause/capture cases passed. See {}.",
+        cases.len(),
+        run.display()
+    );
+    Ok(())
+}
+
+fn acceptance_case(name: &str, result: Result<Value>) -> Case {
+    match result {
+        Ok(evidence) => {
+            println!("PASS {name}");
+            Case {
+                name: name.into(),
+                passed: true,
+                evidence,
+                error: None,
+            }
+        }
+        Err(error) => {
+            eprintln!("FAIL {name}: {error:#}");
+            Case {
+                name: name.into(),
+                passed: false,
+                evidence: Value::Null,
+                error: Some(format!("{error:#}")),
+            }
+        }
+    }
+}
+
+fn await_progress(
+    recorder: &Recorder,
+    timeout: Duration,
+    predicate: impl Fn(&super::Progress) -> bool,
+) -> Result<super::Progress> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let progress = recorder.progress();
+        if predicate(&progress) {
+            return Ok(progress);
+        }
+        ensure!(
+            !recorder.finished(),
+            "Recording ended before the expected transition: {}",
+            progress.detail
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "Expected media transition exceeded {} seconds: {}",
+            timeout.as_secs(),
+            progress.detail
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn await_saved(recorder: &Recorder) -> Result<super::Progress> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !recorder.finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    ensure!(
+        recorder.finished(),
+        "Synthetic media completion exceeded 30 seconds."
+    );
+    let progress = recorder.progress();
+    ensure!(
+        progress.phase == Phase::Saved,
+        "Synthetic capture did not save: {}",
+        progress.detail
+    );
+    ensure!(
+        !progress.devices_opened.webcam
+            && !progress.devices_opened.microphone
+            && !progress.devices_opened.system_audio,
+        "Synthetic capture must not activate personal devices."
+    );
+    Ok(progress)
+}
+
+fn pause_capture(root: &Path, mask: u8, stop_paused: bool) -> Result<Value> {
+    let mut request = request(root, mask)?;
+    request.max_seconds = 5;
+    let recorder = Recorder::start(request.clone());
+    await_progress(&recorder, Duration::from_secs(15), |p| {
+        p.phase == Phase::Recording && p.elapsed_ms >= if stop_paused { 1300 } else { 820 }
+    })?;
+    recorder.pause()?;
+    let paused = await_progress(&recorder, Duration::from_secs(3), |p| {
+        p.phase == Phase::Paused && p.control_ack == 1
+    })?;
+    let hold = Instant::now();
+    while hold.elapsed() < Duration::from_millis(if stop_paused { 450 } else { 1350 }) {
+        let progress = recorder.progress();
+        ensure!(
+            progress.phase == Phase::Paused
+                && progress.elapsed_ms == paused.control_media_sample / 48,
+            "The acknowledged paused media clock advanced or changed phase."
+        );
+        ensure!(
+            progress.frames == paused.frames,
+            "Video frames were admitted after pause acknowledgement."
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let resumed = if stop_paused {
+        recorder.stop();
+        None
+    } else {
+        recorder.resume()?;
+        Some(await_progress(&recorder, Duration::from_secs(3), |p| {
+            p.phase == Phase::Recording && p.control_ack == 2
+        })?)
+    };
+    let progress = await_saved(&recorder)?;
+    let journal: encoder::Journal = library::read_json(&request.session_dir.join("journal.json"))?;
+    let output = journal
+        .output
+        .context("Paused capture has no saved output")?;
+    encoder::validate_video(&output)?;
+    let probe = probe(&output, root)?;
+    let duration = probe["format"]["duration"]
+        .as_str()
+        .context("Paused output duration missing")?
+        .parse::<f64>()?;
+    let active = if stop_paused {
+        paused.control_media_sample as f64 / 48_000.0
+    } else {
+        5.0
+    };
+    ensure!((duration - active).abs() <= 0.20,
+        "Encoded duration {duration:.3}s differs from active duration {active:.3}s by more than 200 ms.");
+    let expected_elapsed = if stop_paused {
+        paused.control_media_sample / 48
+    } else {
+        request.max_seconds * 1000
+    };
+    ensure!(
+        progress.elapsed_ms == expected_elapsed,
+        "Final media elapsed changed during device release or finalization."
+    );
+    let mut sync = Value::Null;
+    if let Some(resumed) = resumed {
+        let removed = (resumed.control_wall_sample - paused.control_wall_sample) as f64 / 48_000.0;
+        ensure!(
+            removed >= 1.30,
+            "The synthetic pause did not last the requested 1.35 wall seconds."
+        );
+        let next_wall_pulse = (resumed.control_wall_sample / 48_000 + 1) as f64;
+        let expected = next_wall_pulse - removed;
+        let start = expected - 0.5;
+        let video =
+            super::profile::video_edge(&output, start, 20, 240, &root.join("resume-video.gray"))?;
+        ensure!(
+            (video - 0.5).abs() <= 0.12,
+            "Resumed video pulse offset was {video:.3}s; expected 0.500s +/-120 ms."
+        );
+        if mask & 12 != 0 {
+            let (system, mic) =
+                super::profile::audio_edges(&output, start, &root.join("resume-audio.f32le"))?;
+            ensure!((system - video).abs() <= 0.12 && (mic - video).abs() <= 0.12,
+                "A/V timing changed across resume: video={video:.3}s system={system:.3}s microphone={mic:.3}s.");
+            sync = json!({"video":video,"system":system,"microphone":mic,"tolerance_seconds":0.12});
+        }
+        let quiet_at = paused.control_media_sample as f64 / 48_000.0 + 0.20;
+        if quiet_at < expected - 0.15 {
+            let image = frame(&output, quiet_at, &root.join("paused-marker-absent.png"))?;
+            assert_pixel(&image, 20, 240, [20, 35, 60], 20)?;
+        }
+        ensure!(
+            progress.wall_elapsed_ms as f64 / 1000.0 >= active + removed,
+            "Wall and active-media durations were not kept distinct."
+        );
+    }
+    Ok(
+        json!({"output":output,"encoded_seconds":duration,"active_seconds":active,
+        "elapsed_media_ms":progress.elapsed_ms,"wall_elapsed_ms":progress.wall_elapsed_ms,
+        "pause_wall_sample":paused.control_wall_sample,"pause_media_sample":paused.control_media_sample,
+        "sync":sync,"audio_queue_peak_bytes":progress.peak_audio_queue_bytes}),
+    )
+}
+
+fn pause_stalled_writer(root: &Path) -> Result<Value> {
+    let mut request = request(root, 0)?;
+    request.max_seconds = 20;
+    request.test_fault = Some(TestFault::WriterStall);
+    let recorder = Recorder::start(request.clone());
+    await_progress(&recorder, Duration::from_secs(15), |p| {
+        p.phase == Phase::Recording
+            && p.elapsed_ms >= 3500
+            && request.session_dir.join("fault-fired.json").is_file()
+    })?;
+    recorder.pause()?;
+    thread::sleep(Duration::from_millis(100));
+    ensure!(
+        recorder.progress().phase == Phase::Pausing,
+        "A blocked writer falsely acknowledged Pause."
+    );
+    let stop = Instant::now();
+    recorder.stop();
+    while !recorder.finished() && stop.elapsed() < Duration::from_secs(7) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    ensure!(
+        recorder.finished(),
+        "Stop during a blocked Pause exceeded its seven-second test limit."
+    );
+    let progress = recorder.progress();
+    ensure!(
+        progress.phase == Phase::Interrupted
+            && progress
+                .detail
+                .contains("Devices/processes have now exited"),
+        "Forced writer shutdown did not confirm owned-process release: {}",
+        progress.detail
+    );
+    Ok(
+        json!({"stop_wall_ms":stop.elapsed().as_millis(),"phase":progress.phase,"detail":progress.detail}),
+    )
+}
+
+fn generated_preview() -> Result<Value> {
+    let preview = super::preview::CameraPreview::start("generated".into(), true, || {});
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let frame = loop {
+        if let Some(error) = preview.take_error() {
+            anyhow::bail!("{error}");
+        }
+        if let Some(frame) = preview.take_frame() {
+            break frame;
+        }
+        ensure!(
+            !preview.finished() && Instant::now() < deadline,
+            "Generated camera preview did not produce a frame."
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    ensure!(
+        frame.width <= 640 && frame.height <= 360,
+        "Preview frame exceeded the bounded transport."
+    );
+    let stop = Instant::now();
+    preview.stop();
+    while !preview.finished() && stop.elapsed() < Duration::from_secs(3) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    ensure!(
+        preview.finished(),
+        "Generated preview release exceeded 3 seconds."
+    );
+    if let Some(error) = preview.take_error() {
+        anyhow::bail!("{error}");
+    }
+    Ok(
+        json!({"width":frame.width,"height":frame.height,"release_ms":stop.elapsed().as_millis(),"real_camera":false}),
+    )
+}
+
+fn pip_capture(root: &Path) -> Result<Value> {
+    let mut request = request(root, 2)?;
+    request.pip = Some(crate::capture::PipLayout {
+        x: 0,
+        y: 0,
+        width: 500,
+    });
+    let recorder = Recorder::start(request.clone());
+    await_saved(&recorder)?;
+    let journal: encoder::Journal = library::read_json(&request.session_dir.join("journal.json"))?;
+    let output = journal.output.context("PiP capture output missing")?;
+    let image = frame(&output, 1.5, &root.join("pip-position.png"))?;
+    assert_pixel(&image, 100, 100, [35, 210, 25], 20)?;
+    assert_pixel(&image, 560, 300, [20, 35, 60], 20)?;
+    Ok(
+        json!({"output":output,"pip":request.pip,"verified":"top-left camera; former bottom-right position contains screen content"}),
+    )
+}
+
 fn request(root: &Path, mask: u8) -> Result<Request> {
     let library = Library::open(root.to_owned())?;
     let request = Request {
