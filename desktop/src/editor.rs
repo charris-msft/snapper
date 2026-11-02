@@ -488,6 +488,7 @@ pub struct Editor {
     video_metadata_dirty: bool,
     video: Option<VideoUi>,
     video_job: Option<VideoJobUi>,
+    switching_capture: bool,
 }
 
 fn native_icon() -> egui::IconData {
@@ -578,13 +579,31 @@ impl Editor {
         });
         let library = Library::open(root)?;
         let library_lock = library::exclusive_lock(&library.root.join("application.lock"))?;
+        let capture_ui = CaptureUi::new(&cc.egui_ctx, &library, window_handle)?;
+        Self::assemble(
+            &cc.egui_ctx,
+            library,
+            library_lock,
+            capture_ui,
+            window_handle,
+            graphics_label,
+        )
+    }
+
+    fn assemble(
+        ctx: &egui::Context,
+        library: Library,
+        library_lock: std::fs::File,
+        capture_ui: CaptureUi,
+        window_handle: isize,
+        graphics_label: String,
+    ) -> Result<Self> {
         let (styles,styles_error)=match library.styles() {
             Ok(styles)=>(styles,None),
             Err(error)=>(default_styles(),Some(format!(
                 "Saved Quick Styles could not be read: {error:#}. Built-in styles are displayed without overwriting styles.json. Restore that file and reopen the app to save style changes."))),
         };
-        let capture_ui = CaptureUi::new(&cc.egui_ctx, &library, window_handle)?;
-        let render = RenderService::new(library.clone(), cc.egui_ctx.clone())?;
+        let render = RenderService::new(library.clone(), ctx.clone())?;
         let startup_error = match (styles_error.clone(), capture_ui.startup_error.clone()) {
             (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
             (a, b) => a.or(b),
@@ -642,8 +661,9 @@ impl Editor {
             video_metadata_dirty: false,
             video: None,
             video_job: None,
+            switching_capture: false,
         };
-        app.refresh(&cc.egui_ctx);
+        app.refresh(ctx);
         Ok(app)
     }
     fn busy(&self) -> bool {
@@ -655,7 +675,15 @@ impl Editor {
             || self.video.as_ref().is_some_and(|video| video.dirty)
     }
     fn editable(&self) -> bool {
-        self.document.is_some()
+        self.document.is_some() && !self.switching_capture
+    }
+    fn document_edits_allowed(&mut self) -> bool {
+        if self.switching_capture {
+            self.status = "Editing is paused while the next capture loads.".into();
+            false
+        } else {
+            true
+        }
     }
     fn task(
         &mut self,
@@ -703,9 +731,32 @@ impl Editor {
         });
     }
     fn open_capture(&mut self, ctx: &egui::Context, capture: Capture) {
-        if self.unsaved() {
+        self.load_capture(ctx, capture, |capture, library, video_control| {
+            if capture.kind == CaptureKind::Video {
+                let document =
+                    crate::video::VideoDocument::open(&library, &capture, &video_control)?;
+                return Ok(TaskResult::VideoLoaded(capture, document));
+            }
+            let data = Some((
+                library::load_image(&library.capture_dir(&capture)?.join("original.png"))?,
+                library.load_document(&capture)?,
+            ));
+            Ok(TaskResult::Loaded(capture, data))
+        });
+    }
+
+    fn load_capture(
+        &mut self,
+        ctx: &egui::Context,
+        capture: Capture,
+        loader: impl FnOnce(Capture, Library, Arc<crate::video::VideoControl>) -> Result<TaskResult>
+            + Send
+            + 'static,
+    ) {
+        if self.unsaved() || self.draft.is_some() {
             self.pending_open = Some(capture.id);
-            self.status = "Finishing the current image save before switching.".into();
+            self.status =
+                "Save current edits and finish the current gesture before switching.".into();
             return;
         }
         if self.busy() {
@@ -719,22 +770,26 @@ impl Editor {
                 control: video_control.clone(),
             });
         }
-        self.task(ctx, move || {
-            if capture.kind == CaptureKind::Video {
-                let document =
-                    crate::video::VideoDocument::open(&library, &capture, &video_control)?;
-                return Ok(TaskResult::VideoLoaded(capture, document));
+        self.begin_document_switch(ctx, move || loader(capture, library, video_control));
+    }
+    fn begin_document_switch(
+        &mut self,
+        ctx: &egui::Context,
+        loader: impl FnOnce() -> Result<TaskResult> + Send + 'static,
+    ) {
+        if self.busy() || self.unsaved() || self.draft.is_some() {
+            self.status = "Finish the current operation and save edits before switching.".into();
+            return;
+        }
+        self.switching_capture = true;
+        self.property_gesture = false;
+        ctx.memory_mut(|memory| {
+            if let Some(focus) = memory.focused() {
+                memory.surrender_focus(focus);
             }
-            let data = if capture.kind == CaptureKind::Image {
-                Some((
-                    library::load_image(&library.capture_dir(&capture)?.join("original.png"))?,
-                    library.load_document(&capture)?,
-                ))
-            } else {
-                None
-            };
-            Ok(TaskResult::Loaded(capture, data))
         });
+        self.status = "Loading the next capture. Current edits are paused.".into();
+        self.task(ctx, loader);
     }
     fn queue_render(&mut self) {
         if let (Some(capture), Some(document), Some(original)) =
@@ -761,6 +816,9 @@ impl Editor {
         self.picking = false;
     }
     fn commit_annotation(&mut self, annotation: Annotation) {
+        if !self.document_edits_allowed() {
+            return;
+        }
         if self
             .document
             .as_ref()
@@ -780,6 +838,9 @@ impl Editor {
         self.queue_render();
     }
     fn undo(&mut self, redo: bool) {
+        if !self.document_edits_allowed() {
+            return;
+        }
         if self.video.is_some() {
             self.undo_video(redo);
             return;
@@ -833,6 +894,18 @@ impl Editor {
             Err(mpsc::TryRecvError::Empty) => None,
         });
         if let Some(result) = result {
+            let result = match result {
+                Ok(TaskResult::VideoLoaded(_, _))
+                    if self.switching_capture
+                        && self
+                            .video_job
+                            .as_ref()
+                            .is_some_and(|job| job.control.check().is_err()) =>
+                {
+                    Err("Opening recording cancelled. The previous capture is unchanged.".into())
+                }
+                result => result,
+            };
             self.task = None;
             self.video_job = None;
             match result {
@@ -924,8 +997,15 @@ impl Editor {
                     self.status = message;
                     self.refresh_pending = true;
                 }
-                Err(error) => self.error = Some(error),
+                Err(error) => {
+                    self.error = Some(error);
+                    if self.switching_capture {
+                        self.status =
+                            "The previous capture is unchanged and available for editing.".into();
+                    }
+                }
             }
+            self.switching_capture = false;
         }
         if let Some(recorder) = &self.recorder {
             self.last_progress = recorder.progress();
@@ -956,13 +1036,8 @@ impl Editor {
         self.poll_delivery(ctx);
     }
     fn import(&mut self, ctx: &egui::Context) {
-        if self.unsaved() {
-            self.error =
-                Some("Wait for the current image to finish saving before importing.".into());
-            return;
-        }
         let library = self.library.clone();
-        self.task(ctx, move || {
+        self.begin_document_switch(ctx, move || {
             let Some(path) = rfd::FileDialog::new()
                 .add_filter("Images", &["png", "jpg", "jpeg"])
                 .pick_file()
@@ -1017,11 +1092,8 @@ impl Editor {
         });
     }
     fn paste(&mut self, ctx: &egui::Context) {
-        if self.unsaved() {
-            return;
-        }
         let library = self.library.clone();
-        self.task(ctx, move || {
+        self.begin_document_switch(ctx, move || {
             let mut clipboard = arboard::Clipboard::new()?;
             let data = clipboard
                 .get_image()
@@ -1149,6 +1221,15 @@ impl Editor {
             });
     }
     fn properties(&mut self, ctx: &egui::Context) {
+        if self.switching_capture {
+            egui::SidePanel::right("properties")
+                .exact_width(268.0)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Loading the next capture. Current edits are paused.");
+                });
+            return;
+        }
         egui::SidePanel::right("properties").exact_width(268.0).resizable(false).show(ctx,|ui|{
             egui::ScrollArea::vertical().show(ui,|ui|{
                 ui.add_space(10.0);ui.heading("Inspector");
@@ -1268,6 +1349,9 @@ impl Editor {
         });
     }
     fn delete_selected(&mut self) {
+        if !self.document_edits_allowed() {
+            return;
+        }
         if let Some(index) = self.selected {
             self.checkpoint();
             if let Some(d) = &mut self.document {
@@ -1392,16 +1476,17 @@ impl Editor {
                 });
                 return;
             }
-            if let Some(capture)=&mut self.current {
-                let before=capture.clone();
+            if let Some(capture)=&self.current {
+                let mut title=capture.title.clone();
+                let mut tags=self.tags.clone();
+                ui.add_enabled_ui(!self.switching_capture, |ui| {
                 ui.horizontal(|ui|{
-                    ui.add(egui::TextEdit::singleline(&mut capture.title).desired_width(220.0).char_limit(100));
+                    ui.add(egui::TextEdit::singleline(&mut title).desired_width(220.0).char_limit(100));
                     ui.label("Tags");
-                    ui.add(egui::TextEdit::singleline(&mut self.tags).hint_text("work, idea, bug").desired_width(200.0).char_limit(1024));
+                    ui.add(egui::TextEdit::singleline(&mut tags).hint_text("work, idea, bug").desired_width(200.0).char_limit(1024));
                 });
-                capture.tags=self.tags.split(',').map(str::trim).filter(|s|!s.is_empty()).take(32)
-                    .map(|s|s.chars().take(20).collect()).collect();
-                if before.title!=capture.title||before.tags!=capture.tags{self.queue_render();}
+                });
+                if let Err(error)=self.set_capture_metadata(title,tags){self.error=Some(format!("{error:#}"));}
             }
             ui.add_space(8.0);
             self.canvas(ui,ctx);
@@ -1498,28 +1583,58 @@ impl Editor {
             }
         });
     }
+    fn set_capture_metadata(&mut self, title: String, tags: String) -> Result<bool> {
+        if !self.document_edits_allowed() {
+            return Ok(false);
+        }
+        let Some(current) = &self.current else {
+            return Ok(false);
+        };
+        let mut edited = current.clone();
+        edited.title = title;
+        edited.tags = tags
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .take(32)
+            .map(|s| s.chars().take(20).collect())
+            .collect();
+        edited.validate()?;
+        let changed = edited.title != current.title || edited.tags != current.tags;
+        self.tags = tags;
+        if changed {
+            let video = edited.kind == CaptureKind::Video;
+            self.current = Some(edited);
+            if video {
+                self.video_metadata_dirty = true;
+            } else {
+                self.queue_render();
+            }
+        }
+        Ok(changed)
+    }
+
     fn video_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if let Some(current) = &mut self.current {
-            let before = (current.title.clone(), current.tags.clone());
+        if self.switching_capture {
+            ui.label("Loading the next recording. Undo, metadata and video edits are paused.");
+            return;
+        }
+        if let Some(current) = &self.current {
+            let mut title = current.title.clone();
+            let mut tags = self.tags.clone();
             ui.horizontal(|ui| {
                 ui.label("Title");
-                ui.add(egui::TextEdit::singleline(&mut current.title).char_limit(100));
+                ui.add(egui::TextEdit::singleline(&mut title).char_limit(100));
                 ui.label("Tags");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.tags)
+                    egui::TextEdit::singleline(&mut tags)
                         .hint_text("work, idea, bug")
                         .char_limit(1024),
                 );
             });
-            current.tags = self
-                .tags
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .take(32)
-                .map(|s| s.chars().take(20).collect())
-                .collect();
-            self.video_metadata_dirty |= before != (current.title.clone(), current.tags.clone());
+            if let Err(error) = self.set_capture_metadata(title, tags) {
+                self.error = Some(format!("{error:#}"));
+            }
         }
         let Some(capture) = self.current.clone() else {
             return;
@@ -1592,6 +1707,9 @@ impl Editor {
                             pixels_per_point: ctx.pixels_per_point(),
                         });
                     }
+                }
+                if self.switching_capture {
+                    return;
                 }
                 let to_point = |pos: Pos2| Point {
                     x: ((pos.x - space.min.x) / self.zoom).clamp(0.0, width as f32 - 0.01),
@@ -1814,7 +1932,11 @@ impl eframe::App for Editor {
         self.smoke_canvas = None;
         self.poll_capture_flow(ctx);
         self.load_poll(ctx);
-        if !self.capture_ui.launcher && self.recorder.is_none() && !ctx.wants_keyboard_input() {
+        if !self.capture_ui.launcher
+            && self.recorder.is_none()
+            && !self.switching_capture
+            && !ctx.wants_keyboard_input()
+        {
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
                 self.undo(ctx.input(|i| i.modifiers.shift));
             }
@@ -2303,6 +2425,217 @@ fn open_path(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn complete_controller_work(app: &mut Editor, ctx: &egui::Context) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (app.busy() || app.generation != app.saved_generation) && Instant::now() < deadline {
+            app.load_poll(ctx);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!app.busy(), "Controller task did not finish.");
+        assert_eq!(
+            app.generation, app.saved_generation,
+            "Image edits did not finish saving."
+        );
+    }
+
+    #[test]
+    fn admitted_capture_load_freezes_real_outgoing_controller_mutations() {
+        use crate::{
+            editor::video_ui::VideoEditCommand,
+            video::{VideoDocument, VideoPlan},
+        };
+        for outcome in ["success", "error", "cancel", "cancel-ready"] {
+            let directory = tempfile::tempdir().unwrap();
+            let library = Library::open(directory.path().to_path_buf()).unwrap();
+            let (a, document_a) =
+                VideoDocument::controller_fixture(&library, "recording-a").unwrap();
+            let (b, document_b) =
+                VideoDocument::controller_fixture(&library, "recording-b").unwrap();
+            let ctx = egui::Context::default();
+            let lock = library::exclusive_lock(&library.root.join("application.lock")).unwrap();
+            let mut app = Editor::assemble(
+                &ctx,
+                library.clone(),
+                lock,
+                CaptureUi::controller_fixture(),
+                0,
+                "headless controller fixture".into(),
+            )
+            .unwrap();
+            complete_controller_work(&mut app, &ctx);
+            app.current = Some(a.clone());
+            app.video = Some(VideoUi::new(document_a));
+            assert!(app
+                .execute_video_edit(VideoEditCommand::Trim(10, 70))
+                .unwrap());
+            app.poll_video(&ctx);
+            complete_controller_work(&mut app, &ctx);
+            assert!(!app.unsaved());
+            let saved_a = app.video.as_ref().unwrap().plan.clone();
+            let (entered, ready) = mpsc::sync_channel(1);
+            let (release, held) = mpsc::sync_channel(1);
+            let (loaded, loaded_result) = mpsc::sync_channel(1);
+            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("outgoing title")));
+            app.load_capture(&ctx, b.clone(), move |capture, _, control| {
+                entered.send(()).unwrap();
+                held.recv_timeout(Duration::from_secs(5)).unwrap();
+                if outcome == "error" {
+                    anyhow::bail!("Held load failed for the regression fixture.");
+                }
+                control.check()?;
+                loaded.send(()).unwrap();
+                Ok(TaskResult::VideoLoaded(capture, document_b))
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(ctx.memory(|memory| memory.focused()).is_none());
+            let load_owner = app.video_job.as_ref().unwrap().control.clone();
+            app.undo(false);
+            app.undo(true);
+            app.delete_selected();
+            assert!(!app
+                .set_capture_metadata("must not replace A".into(), "lost, tags".into())
+                .unwrap());
+            for command in [
+                VideoEditCommand::Trim(0, 10),
+                VideoEditCommand::Remove(2, 4),
+                VideoEditCommand::Split(5),
+                VideoEditCommand::Restore,
+            ] {
+                assert!(!app.execute_video_edit(command).unwrap());
+            }
+            app.render_video(&ctx, false, false);
+            app.render_video(&ctx, true, false);
+            app.render_video(&ctx, true, true);
+            app.poll_video(&ctx);
+            assert!(
+                Arc::ptr_eq(&load_owner, &app.video_job.as_ref().unwrap().control),
+                "Preview/export requests must not replace the admitted load's control."
+            );
+            assert_eq!(app.current.as_ref().unwrap().title, "recording-a");
+            assert_eq!(app.video.as_ref().unwrap().plan, saved_a);
+            assert!(
+                !app.unsaved(),
+                "The loading document accepted an unsaved outgoing edit."
+            );
+            let stored: VideoPlan =
+                library::read_json(&library.capture_dir(&a).unwrap().join("video-edits.json"))
+                    .unwrap();
+            assert_eq!(stored, saved_a);
+            let metadata: Capture =
+                library::read_json(&library.capture_dir(&a).unwrap().join("capture.json")).unwrap();
+            assert_eq!(metadata.title, "recording-a");
+            assert!(metadata.tags.is_empty());
+            if outcome == "cancel" {
+                app.cancel_video_work();
+            }
+            release.send(()).unwrap();
+            if outcome == "cancel-ready" {
+                loaded_result.recv_timeout(Duration::from_secs(2)).unwrap();
+                app.cancel_video_work();
+            }
+            complete_controller_work(&mut app, &ctx);
+            assert!(!app.switching_capture);
+            if outcome == "success" {
+                assert_eq!(app.current.as_ref().unwrap().id, b.id);
+                assert_eq!(app.video.as_ref().unwrap().plan.frames(), 90);
+            } else {
+                assert_eq!(app.current.as_ref().unwrap().id, a.id);
+                assert_eq!(app.video.as_ref().unwrap().plan, saved_a);
+                app.undo(false);
+                assert_eq!(
+                    app.video.as_ref().unwrap().plan.frames(),
+                    90,
+                    "Rejected undo during loading must not consume A's undo history."
+                );
+                app.poll_video(&ctx);
+                complete_controller_work(&mut app, &ctx);
+                assert!(!app.unsaved());
+                assert!(app
+                    .set_capture_metadata("A remains editable".into(), "safe".into())
+                    .unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn admitted_capture_load_freezes_image_undo_delete_annotations_and_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path().to_owned()).unwrap();
+        let a = library
+            .import_image(&RgbaImage::new(64, 48), "Image A")
+            .unwrap();
+        let (b, document_b) =
+            crate::video::VideoDocument::controller_fixture(&library, "recording-b").unwrap();
+        let ctx = egui::Context::default();
+        let lock = library::exclusive_lock(&library.root.join("application.lock")).unwrap();
+        let mut app = Editor::assemble(
+            &ctx,
+            library.clone(),
+            lock,
+            CaptureUi::controller_fixture(),
+            0,
+            "headless controller fixture".into(),
+        )
+        .unwrap();
+        complete_controller_work(&mut app, &ctx);
+        app.open_capture(&ctx, a.clone());
+        complete_controller_work(&mut app, &ctx);
+        let annotation = app.annotation(Point { x: 2.0, y: 2.0 }, Point { x: 40.0, y: 30.0 });
+        app.commit_annotation(annotation.clone());
+        complete_controller_work(&mut app, &ctx);
+        app.commit_annotation(annotation.clone());
+        complete_controller_work(&mut app, &ctx);
+        app.undo(false);
+        complete_controller_work(&mut app, &ctx);
+        app.select(Some(0));
+        let saved = app.document.clone().unwrap();
+        let generation = app.generation;
+        assert_eq!(saved.layers.len(), 1);
+        let (entered, ready) = mpsc::sync_channel(1);
+        let (release, held) = mpsc::sync_channel(1);
+        app.load_capture(&ctx, b, move |capture, _, control| {
+            entered.send(()).unwrap();
+            held.recv_timeout(Duration::from_secs(5)).unwrap();
+            control.check()?;
+            Ok(TaskResult::VideoLoaded(capture, document_b))
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        app.undo(false);
+        app.undo(true);
+        app.delete_selected();
+        app.commit_annotation(annotation);
+        assert!(!app
+            .set_capture_metadata("must not replace Image A".into(), "lost".into())
+            .unwrap());
+        assert_eq!(app.document.as_ref(), Some(&saved));
+        assert_eq!(app.generation, generation);
+        assert_eq!(app.selected, Some(0));
+        assert!(!app.unsaved());
+        assert_eq!(library.load_document(&a).unwrap(), saved);
+        app.cancel_video_work();
+        release.send(()).unwrap();
+        complete_controller_work(&mut app, &ctx);
+        assert_eq!(app.current.as_ref().unwrap().id, a.id);
+        assert_eq!(app.document.as_ref(), Some(&saved));
+        app.undo(true);
+        complete_controller_work(&mut app, &ctx);
+        assert_eq!(
+            app.document.as_ref().unwrap().layers.len(),
+            2,
+            "Blocked edits must preserve the outgoing image's redo history."
+        );
+        app.select(Some(0));
+        app.delete_selected();
+        complete_controller_work(&mut app, &ctx);
+        assert_eq!(app.document.as_ref().unwrap().layers.len(), 1);
+        assert!(app
+            .set_capture_metadata("Image A is still editable".into(), "safe".into())
+            .unwrap());
+        complete_controller_work(&mut app, &ctx);
+        let metadata: Capture =
+            library::read_json(&library.capture_dir(&a).unwrap().join("capture.json")).unwrap();
+        assert_eq!(metadata.title, "Image A is still editable");
+    }
 
     fn smoke_test_canvas(ppp: f32, zoom: f32) -> SmokeCanvas {
         let viewport = Rect::from_min_size(Pos2::new(17.0, 23.0), Vec2::new(1280.0, 840.0));

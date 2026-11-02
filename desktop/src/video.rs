@@ -369,6 +369,51 @@ fn probe(
 }
 
 impl VideoDocument {
+    #[cfg(test)]
+    pub(crate) fn controller_fixture(library: &Library, id: &str) -> Result<(Capture, Self)> {
+        let capture = Capture {
+            schema: 1,
+            id: id.into(),
+            title: id.into(),
+            kind: CaptureKind::Video,
+            created_ms: 0,
+            width: 320,
+            height: 180,
+            tags: vec![],
+        };
+        let directory = library.capture_dir(&capture)?;
+        fs::create_dir(&directory)?;
+        let source = directory.join("recording.mp4");
+        fs::write(&source, b"controller-only fixture; never sent to a codec")?;
+        library.save_capture(&capture)?;
+        library::export_image(
+            &directory.join("thumbnail.png"),
+            &image::RgbaImage::new(1, 1),
+        )?;
+        let mut locked = read_lock(&source)?;
+        let hash = hash_file(&mut locked, &VideoControl::default())?;
+        let info = VideoInfo {
+            width: 320,
+            height: 180,
+            frames: 90,
+            source_seconds: 3.0,
+            origin_seconds: 0.0,
+            audio: false,
+            source_sha256: hash.clone(),
+        };
+        let plan = VideoPlan::new(hash, 90);
+        Ok((
+            capture,
+            Self {
+                directory,
+                source,
+                info,
+                plan,
+                _source_lock: Arc::new(locked),
+            },
+        ))
+    }
+
     pub fn open(library: &Library, capture: &Capture, control: &VideoControl) -> Result<Self> {
         ensure!(
             capture.kind == CaptureKind::Video,

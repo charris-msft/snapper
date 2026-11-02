@@ -44,6 +44,39 @@ pub(super) struct CaptureUi {
 }
 
 impl CaptureUi {
+    #[cfg(test)]
+    pub(super) fn controller_fixture() -> Self {
+        Self {
+            preferences: Preferences::default(),
+            flow: CaptureFlow::default(),
+            launcher: false,
+            startup_error: None,
+            settings_error: None,
+            settings: false,
+            hotkeys: None,
+            escape: None,
+            admission: None,
+            overlay: None,
+            previous_focus: None,
+            monitors: vec![],
+            area: Area::default(),
+            flow_monitor: None,
+            cameras: vec![],
+            audio: vec![],
+            windows: vec![],
+            window_index: 0,
+            preview: None,
+            preview_texture: None,
+            preview_size: (640, 360),
+            pending_arm: None,
+            active_options: None,
+            pending_delivery: None,
+            shortcut_draft: Shortcuts::default(),
+            preset_name: String::new(),
+            attempt_error: None,
+        }
+    }
+
     pub(super) fn new(ctx: &egui::Context, library: &Library, window: isize) -> Result<Self> {
         let (preferences, settings_error) = match Preferences::load(library) {
             Ok(value) => (value, None),

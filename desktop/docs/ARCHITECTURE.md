@@ -127,6 +127,15 @@ to have a hard process-memory ceiling.
 
 ## Focused video editing
 
+An admitted document switch freezes outgoing controller mutations before its
+asynchronous load begins. The gate covers library opens, image imports and
+clipboard imports, keyboard/history actions, metadata, canvas/inspector edits
+and video plan/preview/export requests. A terminal load result releases the gate;
+only successful, uncancelled loads replace the document. Cancellation is checked
+again on UI installation, so cancellation after worker completion still preserves
+the outgoing document. Controller tests hold the real task path behind barriers
+and exercise edits plus successful, failed and cancelled completion.
+
 The video editor stores ordered kept sections in `video-edits.json`, bound to
 the source SHA-256 and an explicit 30 fps timeline. The source is held against
 writes/deletion while open. Its MP4 and committed recovery segments are never

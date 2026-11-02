@@ -125,6 +125,10 @@ player. Titles and tags use **Save title and tags** without rewriting the MP4.
 ## Focused video editing
 
 Open a recording from Library to inspect its original and saved edit plan.
+While another capture opens, edits to the outgoing capture are paused, including
+keyboard undo/redo, title/tags and preview/export requests. **Opening recording**
+shows progress and Cancel. A failed or cancelled load keeps the previous capture
+and its saved edits open; editing resumes after the load stops.
 The edit timeline is explicitly **30 fps**: one frame is 33.333 ms. Time labels
 are rounded for display; selections use whole frames and the end is excluded.
 Variable-rate source video is normalized onto that grid without changing the

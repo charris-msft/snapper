@@ -1,6 +1,13 @@
 use super::*;
 use crate::video::{self, EditedPreview, VideoControl, VideoDocument, VideoPlan, FPS};
 
+pub(super) enum VideoEditCommand {
+    Trim(u32, u32),
+    Remove(u32, u32),
+    Split(u32),
+    Restore,
+}
+
 pub(super) struct VideoUi {
     pub(super) document: VideoDocument,
     pub(super) plan: VideoPlan,
@@ -83,11 +90,10 @@ impl Drop for VideoJobUi {
 
 impl Editor {
     pub(super) fn video_loading_status(&mut self, ctx: &egui::Context) {
-        if self.video.is_some() {
+        if !self.switching_capture {
             return;
         }
-        if let Some(job) = &self.video_job {
-            let progress = job.control.progress();
+        if let Some(progress) = self.video_job.as_ref().map(|job| job.control.progress()) {
             egui::Window::new("Opening recording")
                 .collapsible(false)
                 .resizable(false)
@@ -95,13 +101,26 @@ impl Editor {
                     ui.label(&progress.stage);
                     ui.add(egui::ProgressBar::new(progress.fraction));
                     if ui.button("Cancel").clicked() {
-                        job.control.cancel();
+                        self.cancel_video_work();
                     }
                 });
         }
     }
 
+    pub(super) fn cancel_video_work(&mut self) {
+        if let Some(job) = &self.video_job {
+            self.status = if job.control.cancel() {
+                "Cancellation requested. Waiting for owned codec processes to exit.".into()
+            } else {
+                "Final publication already began. Waiting for saved-file confirmation.".into()
+            };
+        }
+    }
+
     pub(super) fn undo_video(&mut self, redo: bool) {
+        if !self.document_edits_allowed() {
+            return;
+        }
         let Some(video) = &mut self.video else { return };
         let plan = if redo {
             video.redo.pop()
@@ -118,6 +137,33 @@ impl Editor {
                 self.error = Some(format!("{error:#}"));
             }
         }
+    }
+
+    pub(super) fn execute_video_edit(&mut self, command: VideoEditCommand) -> Result<bool> {
+        if !self.document_edits_allowed() {
+            return Ok(false);
+        }
+        let video = self
+            .video
+            .as_mut()
+            .context("No recording is open for editing")?;
+        let mut plan = video.plan.clone();
+        match command {
+            VideoEditCommand::Trim(start, end) => plan = plan.selection(start, end)?,
+            VideoEditCommand::Remove(start, end) => plan.remove(start, end)?,
+            VideoEditCommand::Split(frame) => {
+                plan.split(frame)?;
+            }
+            VideoEditCommand::Restore => {
+                plan = VideoPlan::new(
+                    video.document.info.source_sha256.clone(),
+                    video.document.info.frames,
+                )
+            }
+        }
+        let changed = plan != video.plan;
+        video.apply(plan, true)?;
+        Ok(changed)
     }
 
     pub(super) fn install_video_result(
@@ -168,7 +214,7 @@ impl Editor {
     }
 
     pub(super) fn poll_video(&mut self, ctx: &egui::Context) {
-        if self.busy() {
+        if self.busy() || self.switching_capture {
             return;
         }
         let Some(video) = &mut self.video else { return };
@@ -205,8 +251,8 @@ impl Editor {
         }
     }
 
-    fn render_video(&mut self, ctx: &egui::Context, export: bool, selected: bool) {
-        if self.busy() {
+    pub(super) fn render_video(&mut self, ctx: &egui::Context, export: bool, selected: bool) {
+        if !self.document_edits_allowed() || self.busy() {
             return;
         }
         let Some(video) = &self.video else { return };
@@ -267,6 +313,10 @@ impl Editor {
     }
 
     pub(super) fn focused_video_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !self.document_edits_allowed() {
+            ui.label("Loading the next recording. Current editing and exports are paused.");
+            return;
+        }
         let busy = self.busy();
         let Some(video) = &mut self.video else {
             ui.label("Inspecting the video before enabling editing.");
@@ -281,6 +331,7 @@ impl Editor {
         ));
         ui.small("Frame-accurate on a 30 fps edit timeline (33.333 ms/frame). Accurate re-encoding, not keyframe-rounded copying.");
         let mut action = 0;
+        let mut cancel_requested = false;
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(!busy, egui::Button::new("Update edited preview"))
@@ -313,19 +364,14 @@ impl Editor {
                 action = 5;
             }
         });
-        if let Some(job) = &self.video_job {
-            let progress = job.control.progress();
+        if let Some(progress) = self.video_job.as_ref().map(|job| job.control.progress()) {
             ui.add(egui::ProgressBar::new(progress.fraction).text(format!(
                 "{} ({:.1}s)",
                 progress.stage,
                 progress.elapsed_ms as f64 / 1000.0
             )));
             if ui.button("Cancel video work").clicked() {
-                self.status = if job.control.cancel() {
-                    "Cancellation requested. Waiting for owned codec processes to exit.".into()
-                } else {
-                    "Final publication already began. Waiting for saved-file confirmation.".into()
-                };
+                cancel_requested = true;
             }
         }
         if let Some(preview) = &video.texture {
@@ -394,32 +440,22 @@ impl Editor {
             ));
         });
         let mut proposed = None;
-        let mut failure = None;
         ui.add_enabled_ui(!busy, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Keep selection / trim ends").clicked() {
-                    match video
-                        .plan
-                        .selection(video.selection_start, video.selection_end)
-                    {
-                        Ok(plan) => proposed = Some(plan),
-                        Err(error) => failure = Some(error),
-                    }
+                    proposed = Some(VideoEditCommand::Trim(
+                        video.selection_start,
+                        video.selection_end,
+                    ));
                 }
                 if ui.button("Remove selection").clicked() {
-                    let mut plan = video.plan.clone();
-                    match plan.remove(video.selection_start, video.selection_end) {
-                        Ok(()) => proposed = Some(plan),
-                        Err(error) => failure = Some(error),
-                    }
+                    proposed = Some(VideoEditCommand::Remove(
+                        video.selection_start,
+                        video.selection_end,
+                    ));
                 }
                 if ui.button("Split at playhead").clicked() {
-                    let mut plan = video.plan.clone();
-                    match plan.split(video.playhead) {
-                        Ok(true) => proposed = Some(plan),
-                        Ok(false) => {}
-                        Err(error) => failure = Some(error),
-                    }
+                    proposed = Some(VideoEditCommand::Split(video.playhead));
                 }
                 if ui
                     .add_enabled(!video.undo.is_empty(), egui::Button::new("Undo video edit"))
@@ -434,10 +470,7 @@ impl Editor {
                     action = 7;
                 }
                 if ui.button("Restore full original timeline").clicked() {
-                    proposed = Some(VideoPlan::new(
-                        video.document.info.source_sha256.clone(),
-                        video.document.info.frames,
-                    ));
+                    proposed = Some(VideoEditCommand::Restore);
                 }
             });
             ui.collapsing(
@@ -462,19 +495,20 @@ impl Editor {
                 },
             );
         });
-        if let Some(plan) = proposed {
-            if let Err(error) = video.apply(plan, true) {
-                failure = Some(error);
-            }
-        }
-        if let Some(error) = failure {
-            self.error = Some(format!("{error:#}"));
-        }
         let playback = match action {
-            2 => video.preview.as_ref().map(|preview| preview.path.clone()),
+            2 if proposed.is_none() => video.preview.as_ref().map(|preview| preview.path.clone()),
             5 => Some(video.document.source.clone()),
             _ => None,
         };
+        if cancel_requested {
+            self.cancel_video_work();
+        }
+        if let Some(command) = proposed {
+            if let Err(error) = self.execute_video_edit(command) {
+                self.error = Some(format!("{error:#}"));
+                return;
+            }
+        }
         if let Some(path) = playback {
             if let Err(error) = open_path(&path) {
                 self.error = Some(format!("Opening local video playback: {error:#}"));
