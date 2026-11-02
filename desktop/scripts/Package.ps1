@@ -7,7 +7,11 @@ param(
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\Environment.ps1"
 $Root = (Resolve-Path "$PSScriptRoot\..").Path
-if (-not $OutputPath) { $OutputPath = Join-Path $Root 'dist\SteadyCapture' }
+if (-not $OutputPath) {
+    $revision = (& git -C $Root rev-parse --short HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the local source revision.' }
+    $OutputPath = Join-Path $Root "dist\Snapper-0.2.0-$revision"
+}
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath, $Root)
 Push-Location $Root
 try {
@@ -19,9 +23,9 @@ try {
     if ($Configuration -eq 'Release') { $buildArguments += '--release' }
     & cargo @buildArguments
     if ($LASTEXITCODE -ne 0) { throw "Cargo build failed ($LASTEXITCODE)." }
-    $Executable = Join-Path $Root "target\$($Configuration.ToLowerInvariant())\steadycapture.exe"
+    $Executable = Join-Path $Root "target\$($Configuration.ToLowerInvariant())\snapper-desktop.exe"
     New-Item -ItemType Directory -Force "$OutputPath\tools","$OutputPath\licenses","$OutputPath\docs" | Out-Null
-    Copy-Item -LiteralPath $Executable -Destination "$OutputPath\SteadyCapture.exe" -Force
+    Copy-Item -LiteralPath $Executable -Destination "$OutputPath\snapper-desktop.exe" -Force
     Copy-Item -LiteralPath "$Tools\llvm-mingw-20261020-ucrt-x86_64\bin\libunwind.dll" `
         -Destination "$OutputPath\libunwind.dll" -Force
     Copy-Item -LiteralPath $env:STEADYCAPTURE_FFMPEG -Destination "$OutputPath\tools\ffmpeg.exe" -Force
@@ -54,7 +58,7 @@ try {
     }
     $dependencyLicenses | ConvertTo-Json -Depth 4 | Set-Content "$OutputPath\licenses\dependency-inventory.json" -Encoding utf8
     $probe = [System.Diagnostics.ProcessStartInfo]::new()
-    $probe.FileName = "$OutputPath\SteadyCapture.exe"
+    $probe.FileName = "$OutputPath\snapper-desktop.exe"
     $probe.Arguments = '--devices'
     $probe.UseShellExecute = $false
     $probe.CreateNoWindow = $true
@@ -75,18 +79,19 @@ try {
         command='--devices'; result=$startup; stderr=$stderr.Result
     } | ConvertTo-Json -Depth 8 | Set-Content "$OutputPath\startup-check.json" -Encoding utf8
     $child.Dispose()
-    $files = foreach ($file in @('SteadyCapture.exe','libunwind.dll','tools\ffmpeg.exe','tools\ffprobe.exe')) {
+    $files = foreach ($file in @('snapper-desktop.exe','libunwind.dll','tools\ffmpeg.exe','tools\ffprobe.exe')) {
         $path = Join-Path $OutputPath $file
         [pscustomobject]@{ file=$file; sha256=(Get-FileHash $path -Algorithm SHA256).Hash; bytes=(Get-Item $path).Length }
     }
     [pscustomobject]@{
-        version='0.1.0'; configuration=$Configuration; target='x86_64-pc-windows-gnullvm'
+        version='0.2.0'; configuration=$Configuration; target='x86_64-pc-windows-gnullvm'
         commit=(& git rev-parse HEAD); created_utc=[DateTime]::UtcNow.ToString('o'); files=$files
         clean_path_startup_verified=$true; dirty_source=$dirty
         native_window_gate='Not exercised by --devices. Require Verify-Gui.ps1 evidence for this exact executable.'
     } | ConvertTo-Json -Depth 5 | Set-Content "$OutputPath\build-manifest.json" -Encoding utf8
-    Write-Output "Portable native app: $OutputPath\SteadyCapture.exe"
-    Write-Output 'All optional sources start OFF. No installer, sign-in or background service.'
+    Write-Output "Portable native app: $OutputPath\snapper-desktop.exe"
+    Write-Output 'Saved source choices never activate hardware on launch. No installer, sign-in or background service.'
+    Write-Output 'Local desktop bundle only. The Go CLI and its installed snapper.exe were not replaced.'
     Write-Output 'Actual native-window verification is a separate required, explicitly approved gate.'
 } finally {
     Pop-Location

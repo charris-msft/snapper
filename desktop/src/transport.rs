@@ -68,8 +68,8 @@ impl<W: Write> Matroska<W> {
             0x1549a966,
             vec![
                 uint(0x2ad7b1, 1_000_000),
-                text(0x4d80, "SteadyCapture"),
-                text(0x5741, "SteadyCapture"),
+                text(0x4d80, "Snapper"),
+                text(0x5741, "Snapper"),
             ],
         ))?;
         let mut bitmap = Vec::with_capacity(40);

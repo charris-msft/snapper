@@ -1,5 +1,5 @@
 use image::{Rgba, RgbaImage};
-use steadycapture::{
+use snapper_desktop::{
     library::{self, Library},
     model::*,
     render::Renderer,

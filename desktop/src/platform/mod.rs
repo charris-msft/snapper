@@ -3,6 +3,7 @@ pub mod camera;
 pub mod hotkey;
 pub mod process;
 pub mod screen;
+pub mod selection;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -65,7 +66,7 @@ pub fn initialize_process() -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Area {
     pub monitor: String,
     pub x: u32,
@@ -74,7 +75,7 @@ pub struct Area {
     pub height: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Monitor {
     pub id: String,
     pub left: i32,
@@ -82,6 +83,11 @@ pub struct Monitor {
     pub width: u32,
     pub height: u32,
     pub primary: bool,
+    #[serde(default = "default_dpi")]
+    pub dpi: u32,
+}
+fn default_dpi() -> u32 {
+    96
 }
 impl Monitor {
     pub fn area(&self) -> Area {

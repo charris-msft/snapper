@@ -192,6 +192,11 @@ impl Devices {
             let ready = ready_tx.clone();
             let tx = audio_tx.clone();
             let synthetic = request.synthetic;
+            let selected_id = if system {
+                request.output_id.clone()
+            } else {
+                request.microphone_id.clone()
+            };
             let this_index = index;
             index += 1;
             spawn_device(
@@ -202,7 +207,10 @@ impl Devices {
                     let mut native = if synthetic {
                         None
                     } else {
-                        Some(platform::audio::Audio::open(system)?)
+                        Some(platform::audio::Audio::open_selected(
+                            system,
+                            selected_id.as_deref(),
+                        )?)
                     };
                     if !synthetic {
                         state.update(|p| {
@@ -528,12 +536,13 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut bgra = vec![0; screen.width as usize * screen.height as usize * 4];
-        composite_frame(
+        composite_frame_with_layout(
             &screen,
             camera.as_deref(),
             screen.width,
             screen.height,
             &mut bgra,
+            request.pip,
         );
         shared.update(|p| {
             p.phase = Phase::Stopping;
@@ -651,7 +660,14 @@ fn run_capture(request: &Request, shared: &Shared) -> Result<Capture> {
                 }
                 let repeated = previous_stamp == Some(screen.timestamp);
                 previous_stamp = Some(screen.timestamp);
-                composite_frame(&screen, camera.as_deref(), width, height, &mut output);
+                composite_frame_with_layout(
+                    &screen,
+                    camera.as_deref(),
+                    width,
+                    height,
+                    &mut output,
+                    request.pip,
+                );
                 encoder.video(tick * 1000 / 30, &output)?;
                 shared.update(|p| {
                     p.frames += 1;
@@ -737,6 +753,17 @@ pub fn composite_frame(
     height: u32,
     output: &mut [u8],
 ) {
+    composite_frame_with_layout(screen, camera, width, height, output, None);
+}
+
+pub fn composite_frame_with_layout(
+    screen: &Frame,
+    camera: Option<&Frame>,
+    width: u32,
+    height: u32,
+    output: &mut [u8],
+    layout: Option<crate::capture::PipLayout>,
+) {
     for y in 0..height {
         let sy = y as usize * screen.height as usize / height as usize;
         for x in 0..width {
@@ -748,10 +775,19 @@ pub fn composite_frame(
         }
     }
     if let Some(camera) = camera {
-        let w = (width / 4).clamp(1, 360);
-        let h = (w * camera.height / camera.width).min(height).max(1);
-        let left = width.saturating_sub(w + 12);
-        let top = height.saturating_sub(h + 12);
+        let (left, top, w, h) = if let Some(layout) = layout {
+            let r = layout.rect(width, height, camera.width, camera.height);
+            (r.x, r.y, r.width, r.height)
+        } else {
+            let w = (width / 4).clamp(1, 360);
+            let h = (w * camera.height / camera.width).min(height).max(1);
+            (
+                width.saturating_sub(w + 12),
+                height.saturating_sub(h + 12),
+                w,
+                h,
+            )
+        };
         for y in 0..h {
             for x in 0..w {
                 let sx = x * camera.width / w;

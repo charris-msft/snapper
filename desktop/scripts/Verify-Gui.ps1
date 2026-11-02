@@ -13,7 +13,7 @@ $EvidencePath = [IO.Path]::GetFullPath($EvidencePath, $Root)
 New-Item -ItemType Directory -Force $EvidencePath | Out-Null
 $report = Join-Path $EvidencePath 'gui-startup-check.json'
 $info = [Diagnostics.ProcessStartInfo]::new()
-$info.FileName = Join-Path $PackagePath 'SteadyCapture.exe'
+$info.FileName = Join-Path $PackagePath 'snapper-desktop.exe'
 $info.ArgumentList.Add('--gui-smoke-test')
 $info.ArgumentList.Add($report)
 $info.WorkingDirectory = $Root

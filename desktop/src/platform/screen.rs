@@ -32,7 +32,10 @@ use windows::{
             Graphics::Capture::IGraphicsCaptureItemInterop,
             RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED,
         },
-        UI::WindowsAndMessaging::MONITORINFOF_PRIMARY,
+        UI::{
+            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+            WindowsAndMessaging::MONITORINFOF_PRIMARY,
+        },
     },
 };
 
@@ -70,6 +73,11 @@ unsafe extern "system" fn monitor_callback(
         return BOOL(0);
     }
     let r = info.monitorInfo.rcMonitor;
+    let (mut dpi_x, mut dpi_y) = (0, 0);
+    // SAFETY: Enumeration supplies a live monitor and both output scalars are initialized.
+    if unsafe { GetDpiForMonitor(handle, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_err() {
+        return BOOL(0);
+    }
     let len = info
         .szDevice
         .iter()
@@ -84,6 +92,7 @@ unsafe extern "system" fn monitor_callback(
             width: (r.right - r.left) as u32,
             height: (r.bottom - r.top) as u32,
             primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            dpi: dpi_x,
         },
     ));
     BOOL(1)
@@ -175,7 +184,7 @@ fn capture_format(monitor: HMONITOR) -> Result<PixelMode> {
                         .context("Cannot verify the monitor's SDR color mode")?;
                     let desc = output.GetDesc1()?;
                     ensure!(desc.ColorSpace==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
-                        "This monitor uses HDR/advanced color. SteadyCapture currently supports SDR captures only. Choose an SDR monitor.");
+                        "This monitor uses HDR/advanced color. Snapper currently supports SDR captures only. Choose an SDR monitor.");
                     return Ok(PixelMode::Sdr);
                 }
             }

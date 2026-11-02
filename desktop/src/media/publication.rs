@@ -10,12 +10,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use windows::{
-    core::HSTRING,
-    Win32::Storage::FileSystem::{
-        MoveFileExW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-        MOVEFILE_WRITE_THROUGH,
-    },
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -77,7 +73,7 @@ fn session_id(journal: &Journal) -> Result<&str> {
 
 fn plan_hash(journal: &Journal) -> Result<String> {
     let request = &journal.request;
-    let binding = serde_json::to_vec(&(
+    let mut binding = serde_json::to_vec(&(
         "final-publication-v1",
         journal.schema,
         session_id(journal)?,
@@ -91,6 +87,14 @@ fn plan_hash(journal: &Journal) -> Result<String> {
         request.synthetic,
         &journal.segments,
     ))?;
+    if request.microphone_id.is_some() || request.output_id.is_some() || request.pip.is_some() {
+        binding.extend(serde_json::to_vec(&(
+            "explicit-devices-and-layout-v1",
+            &request.microphone_id,
+            &request.output_id,
+            request.pip,
+        ))?);
+    }
     Ok(format!("{:x}", Sha256::digest(binding)))
 }
 
@@ -316,42 +320,7 @@ impl StableMedia {
     }
 }
 
-pub(super) fn publish_new_file(temporary: &Path, destination: &Path) -> Result<()> {
-    // Rust canonicalization supplies extended-length Windows paths without changing OS policy.
-    let staging_parent = fs::canonicalize(
-        temporary
-            .parent()
-            .context("Staged media has no parent directory")?,
-    )
-    .context("Resolving the staged media directory")?;
-    let parent = fs::canonicalize(
-        destination
-            .parent()
-            .context("Final media has no parent directory")?,
-    )
-    .context("Resolving the final media directory")?;
-    ensure!(
-        staging_parent == parent,
-        "Final media must be published within its staging directory."
-    );
-    let source = staging_parent.join(
-        temporary
-            .file_name()
-            .context("Staged media filename is missing")?,
-    );
-    let destination = parent.join(
-        destination
-            .file_name()
-            .context("Final media filename is missing")?,
-    );
-    // SAFETY: Both UTF-16 paths remain live. Omitting REPLACE_EXISTING preserves any competing final.
-    unsafe {
-        MoveFileExW(
-            &HSTRING::from(source.as_os_str()), &HSTRING::from(destination.as_os_str()),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    }.context("Publishing final media without replacing an existing file; staged media and committed segments were retained")
-}
+pub(crate) use crate::platform::process::publish_new_file;
 
 #[cfg(test)]
 mod tests {
@@ -376,6 +345,9 @@ mod tests {
                 },
                 sources: Sources::default(),
                 camera_id: None,
+                microphone_id: None,
+                output_id: None,
+                pip: None,
                 video: true,
                 max_seconds: 3,
                 synthetic: true,

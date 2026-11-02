@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod editor;
 pub mod graphics;
 pub mod library;

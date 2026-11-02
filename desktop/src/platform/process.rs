@@ -25,6 +25,38 @@ pub fn command(exe: &Path) -> Command {
     command
 }
 
+pub fn publish_new_file(temporary: &Path, destination: &Path) -> Result<()> {
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    let staging_parent = std::fs::canonicalize(
+        temporary
+            .parent()
+            .context("Staged output has no parent directory")?,
+    )?;
+    let parent = std::fs::canonicalize(
+        destination
+            .parent()
+            .context("Final output has no parent directory")?,
+    )?;
+    ensure!(
+        staging_parent == parent,
+        "Output must be published within its staging directory."
+    );
+    let source = staging_parent.join(
+        temporary
+            .file_name()
+            .context("Staged filename is missing")?,
+    );
+    let destination = parent.join(
+        destination
+            .file_name()
+            .context("Final filename is missing")?,
+    );
+    // SAFETY: Extended-length UTF-16 paths remain live; no REPLACE_EXISTING flag is supplied.
+    unsafe {
+        MoveFileExW(&HSTRING::from(source.as_os_str()), &HSTRING::from(destination.as_os_str()), MOVEFILE_WRITE_THROUGH)
+    }.context("Publishing the completed file without overwriting existing content; the library original or committed segments remain available")
+}
+
 pub struct Job {
     handle: OwnedHandle,
 }
@@ -138,8 +170,9 @@ pub fn media_tool(name: &str) -> Result<PathBuf> {
         verify_tool(name, &adjacent)?;
         return Ok(adjacent);
     }
-    let variable = format!("STEADYCAPTURE_{}", name.to_ascii_uppercase());
-    if let Some(value) = std::env::var_os(variable) {
+    let variable = format!("SNAPPER_{}", name.to_ascii_uppercase());
+    let legacy = format!("STEADYCAPTURE_{}", name.to_ascii_uppercase());
+    if let Some(value) = std::env::var_os(variable).or_else(|| std::env::var_os(legacy)) {
         let path = PathBuf::from(value);
         ensure!(
             path.is_absolute() && path.is_file(),

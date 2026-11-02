@@ -120,6 +120,26 @@ fn publish_progress(state: &Mutex<Progress>, stop: &AtomicBool, incoming: Progre
     *current = merge_progress(incoming, stop.load(Ordering::Acquire));
 }
 
+fn persist_exit_progress(
+    state: &Mutex<Progress>,
+    stop: &AtomicBool,
+    peak_memory: usize,
+    path: &std::path::Path,
+    before_persist: impl FnOnce(),
+) -> Result<Progress> {
+    let mut current = state.lock().unwrap_or_else(|e| e.into_inner());
+    current.peak_job_committed_bytes = peak_memory;
+    before_persist();
+    // Stop, the exit snapshot and its durable publication share one boundary.
+    // Never copy an earlier heartbeat back over an acknowledged Stop.
+    if stop.load(Ordering::Acquire) && matches!(current.phase, Phase::Starting | Phase::Recording) {
+        current.phase = Phase::Stopping;
+        current.detail = "Stop requested. Waiting for confirmed device release.".into();
+    }
+    library::write_json(path, &*current)?;
+    Ok(current.clone())
+}
+
 fn supervise(
     request: &Request,
     progress: &Arc<Mutex<Progress>>,
@@ -253,10 +273,13 @@ fn supervise(
             reader
                 .join()
                 .map_err(|_| anyhow::anyhow!("Worker status reader panicked"))?;
-            let mut p = progress.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            p.peak_job_committed_bytes = peak_memory;
-            *progress.lock().unwrap_or_else(|e| e.into_inner()) = p.clone();
-            library::write_json(&request.session_dir.join("last-progress.json"), &p)?;
+            let p = persist_exit_progress(
+                progress,
+                stop,
+                peak_memory,
+                &request.session_dir.join("last-progress.json"),
+                || {},
+            )?;
             if let Some(reason) = forced {
                 bail!("{reason} Devices/processes have now exited. Last committed segments were retained.");
             }
@@ -326,6 +349,43 @@ fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stop_at_worker_exit_cannot_regress_visible_or_durable_progress() {
+        use std::sync::Barrier;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("last-progress.json");
+        let progress = Arc::new(Mutex::new(Progress {
+            phase: Phase::Recording,
+            ..Default::default()
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let exit_locked = Arc::new(Barrier::new(2));
+        let stop_requested = Arc::new(Barrier::new(2));
+        let state = progress.clone();
+        let flag = stop.clone();
+        let entered = exit_locked.clone();
+        let release = stop_requested.clone();
+        let output = path.clone();
+        let exit = thread::spawn(move || {
+            persist_exit_progress(&state, &flag, 12345, &output, || {
+                entered.wait();
+                release.wait();
+            })
+            .unwrap()
+        });
+        exit_locked.wait();
+        assert!(
+            progress.try_lock().is_err(),
+            "The exit snapshot must retain the state lock until publication."
+        );
+        stop.store(true, Ordering::Release);
+        stop_requested.wait();
+        assert_eq!(exit.join().unwrap().phase, Phase::Stopping);
+        assert_eq!(progress.lock().unwrap().phase, Phase::Stopping);
+        let saved: Progress = library::read_json(&path).unwrap();
+        assert_eq!(saved.phase, Phase::Stopping);
+        assert_eq!(saved.peak_job_committed_bytes, 12345);
+    }
     #[test]
     fn stop_acknowledged_after_a_reader_snapshot_cannot_be_overwritten() {
         use std::sync::Barrier;

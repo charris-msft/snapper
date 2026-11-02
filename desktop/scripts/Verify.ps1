@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 [CmdletBinding()]
 param(
-    [string]$PackagePath = 'dist\SteadyCapture',
+    [Parameter(Mandatory)][string]$PackagePath,
     [string]$EvidencePath = 'artifacts\portable-acceptance',
     [ValidateSet('All','Media','Faults')][string]$Suite = 'All'
 )
@@ -15,7 +15,7 @@ foreach ($name in $names) {
     $directory = Join-Path $EvidencePath $name.ToLowerInvariant()
     $option = if ($name -eq 'Media') { '--self-test' } else { '--fault-test' }
     $info = [Diagnostics.ProcessStartInfo]::new()
-    $info.FileName = Join-Path $PackagePath 'SteadyCapture.exe'
+    $info.FileName = Join-Path $PackagePath 'snapper-desktop.exe'
     $info.ArgumentList.Add($option)
     $info.ArgumentList.Add($directory)
     $info.WorkingDirectory = $Root
@@ -26,6 +26,8 @@ foreach ($name in $names) {
     $info.EnvironmentVariables['PATH'] = "$env:SystemRoot\System32;$env:SystemRoot"
     [void]$info.EnvironmentVariables.Remove('STEADYCAPTURE_FFMPEG')
     [void]$info.EnvironmentVariables.Remove('STEADYCAPTURE_FFPROBE')
+    [void]$info.EnvironmentVariables.Remove('SNAPPER_FFMPEG')
+    [void]$info.EnvironmentVariables.Remove('SNAPPER_FFPROBE')
     $child = [Diagnostics.Process]::Start($info)
     $stdout = $child.StandardOutput.ReadToEndAsync()
     $stderr = $child.StandardError.ReadToEndAsync()

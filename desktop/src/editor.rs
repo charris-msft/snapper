@@ -1,11 +1,14 @@
+mod capture_ui;
+
 use crate::{
     library::{self, Capture, CaptureKind, Library},
-    media::{self, supervisor::Recorder, Phase, Progress, Request, Sources},
+    media::{self, supervisor::Recorder, Phase, Progress, Sources},
     model::*,
-    platform::{self, camera::CameraInfo, Area, Monitor},
+    platform::{self, audio::AudioDevice, camera::CameraInfo, selection::WindowGuide},
     render::{RenderCancelled, Renderer},
 };
 use anyhow::{ensure, Context, Result};
+use capture_ui::CaptureUi;
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, Vec2};
 use image::RgbaImage;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -302,7 +305,10 @@ enum TaskResult {
         Vec<String>,
     ),
     Loaded(Capture, Option<(RgbaImage, Document)>),
-    Cameras(Vec<CameraInfo>),
+    Devices(Vec<CameraInfo>, Vec<AudioDevice>),
+    WindowGuides(Vec<WindowGuide>),
+    OutputDirectory(PathBuf),
+    VideoMetadataSaved(Capture),
     Notice(String),
 }
 struct Draft {
@@ -313,7 +319,7 @@ struct Draft {
 
 pub struct Editor {
     _library_lock: std::fs::File,
-    hotkey: Option<platform::hotkey::GlobalStop>,
+    capture_ui: CaptureUi,
     window_handle: isize,
     graphics_label: String,
     renderer_fixture: bool,
@@ -353,28 +359,22 @@ pub struct Editor {
     show_recent: bool,
     status: String,
     error: Option<String>,
-    monitors: Vec<Monitor>,
-    area: Area,
-    cameras: Vec<CameraInfo>,
-    camera_index: usize,
-    sources: Sources,
-    duration_minutes: u32,
     recorder: Option<Recorder>,
     last_progress: Progress,
     pending_open: Option<String>,
     refresh_pending: bool,
-    countdown: Option<(Instant, bool)>,
     hide_for_capture: bool,
     close_warning: bool,
     property_gesture: bool,
+    video_metadata_dirty: bool,
 }
 
 fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1440.0, 940.0])
-            .with_min_inner_size([1050.0, 720.0])
-            .with_title("SteadyCapture"),
+            .with_inner_size([560.0, 680.0])
+            .with_min_inner_size([480.0, 440.0])
+            .with_title("Snapper"),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: crate::graphics::configuration(),
         ..Default::default()
@@ -384,7 +384,7 @@ fn native_options() -> eframe::NativeOptions {
 pub fn run(root: PathBuf) -> Result<()> {
     let options = native_options();
     eframe::run_native(
-        "SteadyCapture",
+        "Snapper",
         options,
         Box::new(move |cc| Ok(Box::new(Editor::new(cc, root)?))),
     )
@@ -409,7 +409,7 @@ impl Editor {
         );
         let window_handle = match cc.window_handle()?.as_raw() {
             RawWindowHandle::Win32(handle) => handle.hwnd.get(),
-            _ => anyhow::bail!("SteadyCapture requires a native Win32 window."),
+            _ => anyhow::bail!("Snapper requires a native Win32 window."),
         };
         let mut visuals = egui::Visuals::light();
         visuals.panel_fill = Color32::WHITE;
@@ -434,18 +434,16 @@ impl Editor {
             Err(error)=>(default_styles(),Some(format!(
                 "Saved Quick Styles could not be read: {error:#}. Built-in styles are displayed without overwriting styles.json. Restore that file and reopen the app to save style changes."))),
         };
-        let monitors = platform::screen::monitors()?;
-        let area = monitors.first().context("No monitor is available")?.area();
+        let capture_ui = CaptureUi::new(&cc.egui_ctx, &library, window_handle)?;
         let render = RenderService::new(library.clone(), cc.egui_ctx.clone())?;
-        let repaint = cc.egui_ctx.clone();
-        let (hotkey, hotkey_error) =
-            match platform::hotkey::GlobalStop::new(move || repaint.request_repaint()) {
-                Ok(hotkey) => (Some(hotkey), None),
-                Err(error) => (None, Some(format!("{error:#}"))),
-            };
+        let startup_error = match (styles_error.clone(), capture_ui.startup_error.clone()) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (a, b) => a.or(b),
+        };
+        let show_recent = capture_ui.preferences.show_recent;
         let mut app = Self {
             _library_lock: library_lock,
-            hotkey,
+            capture_ui,
             window_handle,
             graphics_label,
             renderer_fixture: false,
@@ -482,26 +480,17 @@ impl Editor {
             zoom: 1.0,
             fit: true,
             show_effects: false,
-            show_recent: true,
+            show_recent,
             status: "Local by design. Nothing is uploaded.".into(),
-            error: match (styles_error, hotkey_error) {
-                (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
-                (a, b) => a.or(b),
-            },
-            monitors,
-            area,
-            cameras: vec![],
-            camera_index: 0,
-            sources: Sources::default(),
-            duration_minutes: 60,
+            error: startup_error,
             recorder: None,
             last_progress: Progress::default(),
             pending_open: None,
             refresh_pending: false,
-            countdown: None,
             hide_for_capture: false,
             close_warning: false,
             property_gesture: false,
+            video_metadata_dirty: false,
         };
         app.refresh(&cc.egui_ctx);
         Ok(app)
@@ -510,7 +499,7 @@ impl Editor {
         self.task.is_some()
     }
     fn unsaved(&self) -> bool {
-        self.generation != self.saved_generation
+        self.generation != self.saved_generation || self.video_metadata_dirty
     }
     fn editable(&self) -> bool {
         self.document.is_some()
@@ -700,6 +689,8 @@ impl Editor {
                     self.texture = None;
                     self.flattened = None;
                     self.fit = true;
+                    self.video_metadata_dirty = false;
+                    self.show_editor(ctx);
                     if let Some((original, document)) = data {
                         self.original = Some(Arc::new(original));
                         self.document = Some(document);
@@ -709,17 +700,25 @@ impl Editor {
                         self.document = None;
                     }
                 }
-                Ok(TaskResult::Cameras(cameras)) => {
-                    self.cameras = cameras;
-                    self.camera_index = 0;
-                    self.status = if self.cameras.is_empty() {
-                        "No camera was found. Webcam remains off.".into()
-                    } else {
-                        format!(
-                            "{} camera(s) found. No device was activated.",
-                            self.cameras.len()
-                        )
-                    };
+                Ok(TaskResult::Devices(cameras, audio)) => {
+                    self.capture_ui.receive_devices(cameras, audio);
+                    self.status =
+                        "Device names refreshed. No camera or audio source was opened.".into();
+                }
+                Ok(TaskResult::WindowGuides(windows)) => {
+                    self.capture_ui.receive_windows(windows);
+                    self.status = "Choose a window to guide a fixed screen region.".into();
+                }
+                Ok(TaskResult::OutputDirectory(path)) => {
+                    self.capture_ui.preferences.capture.output_directory = Some(path);
+                }
+                Ok(TaskResult::VideoMetadataSaved(saved)) => {
+                    self.video_metadata_dirty = self.current.as_ref().is_some_and(|current| {
+                        current.id == saved.id
+                            && (current.title != saved.title || current.tags != saved.tags)
+                    });
+                    self.status = "Video title and tags saved locally.".into();
+                    self.refresh_pending = true;
                 }
                 Ok(TaskResult::Notice(message)) => {
                     self.status = message;
@@ -733,17 +732,8 @@ impl Editor {
             if recorder.finished() {
                 let progress = recorder.progress();
                 self.recorder = None;
-                if let Some(hotkey) = &self.hotkey {
-                    hotkey
-                        .flag
-                        .store(false, std::sync::atomic::Ordering::Release);
-                }
-                if self.hide_for_capture {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    self.hide_for_capture = false;
-                }
+                self.capture_finished(ctx, &progress);
                 if progress.phase == Phase::Saved {
-                    self.pending_open = progress.capture_id.clone();
                     self.refresh_pending = true;
                     self.status = progress.detail.clone();
                 } else {
@@ -763,79 +753,7 @@ impl Editor {
                 }
             }
         }
-    }
-    fn capture(&mut self, ctx: &egui::Context, video: bool) {
-        if self.renderer_fixture {
-            self.error =
-                Some("Capture is disabled in the renderer-only verification window.".into());
-            return;
-        }
-        if self.recorder.is_some() || self.countdown.is_some() {
-            return;
-        }
-        if self.sources.webcam && self.cameras.get(self.camera_index).is_none() {
-            self.error = Some("Scan cameras and choose a device, or turn Webcam off.".into());
-            return;
-        }
-        if let Some(hotkey) = &self.hotkey {
-            hotkey
-                .flag
-                .store(false, std::sync::atomic::Ordering::Release);
-        }
-        self.countdown = Some((Instant::now() + Duration::from_secs(3), video));
-        self.status = if video {
-            "Recording starts after the visible 3-second countdown.".into()
-        } else {
-            "Screenshot in 3 seconds. This window will briefly hide.".into()
-        };
-        ctx.request_repaint();
-    }
-    fn start_capture(&mut self, ctx: &egui::Context, video: bool) {
-        let mut sources = self.sources.clone();
-        if !video {
-            sources.system_audio = false;
-            sources.microphone = false;
-        }
-        let request = Request {
-            schema: 1,
-            session_dir: self.library.root.join("sessions").join(library::id()),
-            library_root: self.library.root.clone(),
-            area: self.area.clone(),
-            sources,
-            camera_id: self.cameras.get(self.camera_index).map(|c| c.id.clone()),
-            video,
-            max_seconds: u64::from(self.duration_minutes) * 60,
-            synthetic: false,
-            test_fault: None,
-        };
-        if !video {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.hide_for_capture = true;
-        }
-        self.recorder = Some(if let Some(hotkey) = &self.hotkey {
-            Recorder::start_with_stop(request, hotkey.flag.clone())
-        } else {
-            Recorder::start(request)
-        });
-        if !video {
-            let complete = self.recorder.as_ref().unwrap().completion_signal();
-            let window = self.window_handle;
-            let context = ctx.clone();
-            thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while !complete.load(std::sync::atomic::Ordering::Acquire)
-                    && Instant::now() < deadline
-                {
-                    thread::sleep(Duration::from_millis(25));
-                }
-                context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                if let Err(error) = platform::process::restore_owned_window(window) {
-                    eprintln!("Editor restore after screenshot: {error:#}");
-                }
-                context.request_repaint();
-            });
-        }
-        self.last_progress = Progress::default();
+        self.poll_delivery(ctx);
     }
     fn import(&mut self, ctx: &egui::Context) {
         if self.unsaved() {
@@ -926,11 +844,19 @@ impl Editor {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(12.0);
-                    ui.label(RichText::new("SC").size(23.0).strong().color(TEAL));
-                    ui.label(RichText::new("SteadyCapture").size(23.0).strong());
+                    ui.label(RichText::new("Snapper").size(23.0).strong().color(TEAL));
                     ui.add_space(14.0);
                     ui.label(RichText::new("LOCAL ONLY").small().color(TEAL));
                     ui.separator();
+                    if ui
+                        .add_enabled(
+                            !self.unsaved() && !self.busy(),
+                            egui::Button::new("New capture"),
+                        )
+                        .clicked()
+                    {
+                        self.show_launcher(ctx);
+                    }
                     ui.selectable_value(&mut self.page_library, false, "Editor");
                     ui.selectable_value(&mut self.page_library, true, "Library");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -961,148 +887,69 @@ impl Editor {
                     });
                 });
             });
-        egui::TopBottomPanel::top("tools").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.add_enabled_ui(self.editable() && !self.page_library, |ui| {
-                    for tool in Tool::TOOLS {
-                        let label = match tool {
-                            Tool::CutHorizontal => "Cut H",
-                            Tool::CutVertical => "Cut V",
-                            Tool::CutJagged => "Jagged cut",
-                            Tool::Replace => "Color replace",
-                            _ => tool.label(),
-                        };
+        egui::SidePanel::left("tools")
+            .exact_width(146.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    ui.add_enabled_ui(self.editable() && !self.page_library, |ui| {
+                        for tool in Tool::TOOLS {
+                            let label = match tool {
+                                Tool::CutHorizontal => "Cut H",
+                                Tool::CutVertical => "Cut V",
+                                Tool::CutJagged => "Jagged cut",
+                                Tool::Replace => "Color replace",
+                                _ => tool.label(),
+                            };
+                            if ui
+                                .selectable_label(self.tool == tool, label)
+                                .on_hover_text(tool.label())
+                                .clicked()
+                            {
+                                self.change_tool(tool);
+                            }
+                        }
+                        ui.separator();
                         if ui
-                            .selectable_label(self.tool == tool, label)
-                            .on_hover_text(tool.label())
+                            .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
                             .clicked()
                         {
-                            self.change_tool(tool);
+                            self.undo(false);
                         }
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(self.history.can_undo(), egui::Button::new("Undo"))
-                        .clicked()
-                    {
-                        self.undo(false);
-                    }
-                    if ui
-                        .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
-                        .clicked()
-                    {
-                        self.undo(true);
-                    }
-                });
-            });
-        });
-    }
-    fn capture_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("capture").exact_width(232.0).resizable(false).show(ctx,|ui|{
-            ui.add_space(12.0);ui.heading("Capture");ui.label(RichText::new("Your screen. Your sources.").weak());
-            ui.add_space(10.0);
-            let inactive=!self.renderer_fixture&&self.recorder.is_none()&&self.countdown.is_none();
-            ui.add_enabled_ui(inactive,|ui|{
-                let before=self.area.monitor.clone();
-                egui::ComboBox::from_id_salt("monitor").width(200.0)
-                    .selected_text(format!("{}{}",if self.monitors.iter().any(|m|m.id==self.area.monitor&&m.primary){"Primary " }else{""},self.area.monitor))
-                    .show_ui(ui,|ui|{
-                        for monitor in &self.monitors {ui.selectable_value(&mut self.area.monitor,monitor.id.clone(),
-                            format!("{}  {} x {}",monitor.id,monitor.width,monitor.height));}
+                        if ui
+                            .add_enabled(self.history.can_redo(), egui::Button::new("Redo"))
+                            .clicked()
+                        {
+                            self.undo(true);
+                        }
                     });
-                if before!=self.area.monitor {
-                    if let Some(m)=self.monitors.iter().find(|m|m.id==self.area.monitor){self.area=m.area();}
-                }
-                ui.collapsing("Region (physical pixels)",|ui|{
-                    let monitor=self.monitors.iter().find(|m|m.id==self.area.monitor);
-                    if let Some(m)=monitor {
-                        let (w,h)=(m.width,m.height);
-                        egui::Grid::new("region").num_columns(2).show(ui,|ui|{
-                            ui.label("Left");ui.add(egui::DragValue::new(&mut self.area.x).range(0..=w.saturating_sub(1)));ui.end_row();
-                            ui.label("Top");ui.add(egui::DragValue::new(&mut self.area.y).range(0..=h.saturating_sub(1)));ui.end_row();
-                            ui.label("Width");ui.add(egui::DragValue::new(&mut self.area.width).range(1..=w-self.area.x));ui.end_row();
-                            ui.label("Height");ui.add(egui::DragValue::new(&mut self.area.height).range(1..=h-self.area.y));ui.end_row();
-                        });
-                        if ui.button("Whole monitor").clicked(){self.area=m.area();}
-                    }
                 });
-                ui.add_space(8.0);
-                ui.checkbox(&mut self.sources.cursor,"Include cursor");
-                ui.checkbox(&mut self.sources.webcam,"Include webcam");
-                if self.sources.webcam {
-                    if ui.add_enabled(!self.busy(),egui::Button::new("Scan cameras")).clicked(){
-                        self.task(ctx,||Ok(TaskResult::Cameras(platform::camera::list()?)));
-                    }
-                    egui::ComboBox::from_id_salt("camera").width(195.0)
-                        .selected_text(self.cameras.get(self.camera_index).map(|c|c.name.as_str()).unwrap_or("Choose a camera"))
-                        .show_ui(ui,|ui|{
-                            for (i,camera) in self.cameras.iter().enumerate(){ui.selectable_value(&mut self.camera_index,i,&camera.name);}
-                        });
-                    ui.small("Opens only when you start capture.");
-                }
-                ui.separator();
-                ui.label(RichText::new("RECORDING AUDIO").small().strong());
-                ui.checkbox(&mut self.sources.system_audio,"System audio");
-                ui.checkbox(&mut self.sources.microphone,"Microphone");
-                ui.small("Windows default devices. Audio is never opened for screenshots.");
-                if self.sources.system_audio{ui.small("Records the entire output-device mix, including other apps.");}
-                ui.add_space(8.0);
-                ui.horizontal(|ui|{ui.label("Limit");ui.add(egui::DragValue::new(&mut self.duration_minutes).range(1..=120));ui.label("minutes");});
-                ui.add_space(10.0);
-                if ui.add_sized([210.0,36.0],egui::Button::new("Take screenshot").fill(Color32::from_rgb(221,242,239))).clicked(){self.capture(ctx,false);}
-                if ui.add_sized([210.0,36.0],egui::Button::new(RichText::new("Record screen").color(Color32::WHITE)).fill(TEAL)).clicked(){self.capture(ctx,true);}
             });
-            if let Some((deadline,video))=self.countdown {
-                ui.add_space(10.0);
-                ui.label(RichText::new(format!("{} in {}...",if video{"Recording"}else{"Screenshot"},
-                    deadline.saturating_duration_since(Instant::now()).as_secs()+1)).strong().color(TEAL));
-                if ui.button("Cancel countdown").clicked(){self.countdown=None;self.status="Capture cancelled. No devices opened.".into();}
-            }
-            if let Some(recorder)=&self.recorder {
-                ui.add_space(14.0);
-                let p=&self.last_progress;
-                ui.label(RichText::new(format!("{:?}",p.phase)).strong().color(Color32::from_rgb(193,43,61)));
-                ui.label(format!("{:02}:{:02}",p.elapsed_ms/60_000,(p.elapsed_ms/1000)%60));
-                ui.label(format!("{} frames | {} skipped",p.frames,p.skipped));
-                if matches!(p.phase,Phase::DevicesStopped|Phase::Finalizing) {
-                    if ui.add_sized([210.0,40.0],egui::Button::new("Cancel finalization")).clicked(){recorder.cancel_finalization();}
-                    ui.small("Cancelling keeps completed segments for recovery.");
-                }else if ui.add_sized([210.0,40.0],egui::Button::new(RichText::new("STOP RECORDING").color(Color32::WHITE)).fill(Color32::from_rgb(193,43,61))).clicked(){recorder.stop();}
-                ui.small(if self.hotkey.is_some(){"Ctrl+Shift+F9 stops from any app. Esc stops while focused."}
-                    else{"Esc also stops while this window is focused."});
-                ui.small(&p.detail);
-                ui.small(&p.screen_backend);
-            }
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT),|ui|{
-                ui.small("SDR only. Video fits within 1920 x 1080 at 30 fps. Native-size screenshots.");
-                ui.small("No sign-in. No cloud. No background recording.");
-                if ui.button("Open library folder").clicked(){
-                    if let Err(e)=open_path(&self.library.root){self.error=Some(format!("{e:#}"));}
-                }
-            });
-        });
     }
     fn properties(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("properties").exact_width(268.0).resizable(false).show(ctx,|ui|{
             egui::ScrollArea::vertical().show(ui,|ui|{
-                ui.add_space(10.0);ui.heading("Quick styles");
+                ui.add_space(10.0);ui.heading("Inspector");
                 ui.horizontal(|ui|{
                     ui.selectable_value(&mut self.favorites_only,false,"All");
                     ui.selectable_value(&mut self.favorites_only,true,"Favorites");
                 });
                 let styles=self.styles.clone();
                 let favorites_only=self.favorites_only;
-                for (i,s) in styles.iter().enumerate().filter(|(_,s)|!favorites_only||s.favorite) {
-                    ui.horizontal(|ui|{
-                        let color=Color32::from_rgba_unmultiplied(s.style.color[0],s.style.color[1],s.style.color[2],255);
-                        if ui.add_sized([180.0,31.0],egui::Button::new(RichText::new(&s.name).color(color))).clicked(){
-                            self.change_tool(s.tool);self.style=s.style.clone();
-                        }
-                        if ui.add_enabled(!self.busy(),egui::Button::new(if s.favorite{"*"}else{"+"})).on_hover_text("Pin or unpin Favorite").clicked(){
-                            self.styles[i].favorite = !s.favorite;self.persist_styles(ctx);
+                egui::ComboBox::from_id_salt("saved annotation styles").width(240.0)
+                    .selected_text(if favorites_only{"Choose a favorite style"}else{"Choose a saved style"})
+                    .show_ui(ui,|ui|{
+                        for (i,s) in styles.iter().enumerate().filter(|(_,s)|!favorites_only||s.favorite) {
+                            ui.horizontal(|ui|{
+                                if ui.selectable_label(false,format!("{} - {}",s.name,s.tool.label())).clicked(){
+                                    self.change_tool(s.tool);self.style=s.style.clone();
+                                }
+                                if ui.add_enabled(!self.busy(),egui::Button::new(if s.favorite{"Unpin"}else{"Pin"})).clicked(){
+                                    self.styles[i].favorite = !s.favorite;self.persist_styles(ctx);
+                                }
+                            });
                         }
                     });
-                }
                 ui.add(egui::TextEdit::singleline(&mut self.style_name).hint_text("New style name").char_limit(80));
                 if ui.add_enabled(!self.busy()&&!self.style_name.trim().is_empty()&&self.tool!=Tool::Select,
                     egui::Button::new("Save current style")).clicked(){
@@ -1213,7 +1060,9 @@ impl Editor {
     fn footer(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.show_recent, "Recent");
+                if ui.checkbox(&mut self.show_recent, "Recent").changed() {
+                    self.save_preferences();
+                }
                 if let Some(capture) = &self.current {
                     ui.label(&capture.title);
                 }
@@ -1316,7 +1165,7 @@ impl Editor {
                     ui.add_space(16.0);
                     if ui.add_enabled(!self.busy(),egui::Button::new("Open a PNG or JPEG")).clicked(){self.import(ctx);}
                     if ui.add_enabled(!self.busy(),egui::Button::new("Paste clipboard image")).clicked(){self.paste(ctx);}
-                    ui.add_space(16.0);ui.small("Choose your capture sources on the left. All optional sources start OFF.");
+                    ui.add_space(16.0);ui.small("Choose New capture to select a screen region and review sources.");
                     if self.unsaved(){ui.spinner();}
                 });
                 return;
@@ -1428,9 +1277,45 @@ impl Editor {
         });
     }
     fn video_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if let Some(current) = &mut self.current {
+            let before = (current.title.clone(), current.tags.clone());
+            ui.horizontal(|ui| {
+                ui.label("Title");
+                ui.add(egui::TextEdit::singleline(&mut current.title).char_limit(100));
+                ui.label("Tags");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tags)
+                        .hint_text("work, idea, bug")
+                        .char_limit(1024),
+                );
+            });
+            current.tags = self
+                .tags
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .take(32)
+                .map(|s| s.chars().take(20).collect())
+                .collect();
+            self.video_metadata_dirty |= before != (current.title.clone(), current.tags.clone());
+        }
         let Some(capture) = self.current.clone() else {
             return;
         };
+        if ui
+            .add_enabled(
+                self.video_metadata_dirty && !self.busy(),
+                egui::Button::new("Save title and tags"),
+            )
+            .clicked()
+        {
+            let library = self.library.clone();
+            let saved = capture.clone();
+            self.task(ctx, move || {
+                library.save_capture(&saved)?;
+                Ok(TaskResult::VideoMetadataSaved(saved))
+            });
+        }
         ui.heading(&capture.title);
         if let Some(texture) = self.thumbnails.get(&capture.id) {
             ui.add(egui::Image::new(texture).max_size(Vec2::new(640.0, 360.0)));
@@ -1751,30 +1636,9 @@ impl Editor {
 impl eframe::App for Editor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.smoke_canvas = None;
-        if let Some(hotkey) = &self.hotkey {
-            if let Some(error) = hotkey.take_error() {
-                self.error = Some(error);
-            }
-            if self.recorder.is_none()
-                && hotkey.flag.swap(false, std::sync::atomic::Ordering::AcqRel)
-            {
-                self.countdown = None;
-            }
-        }
+        self.poll_capture_flow(ctx);
         self.load_poll(ctx);
-        if let Some((deadline, video)) = self.countdown {
-            if Instant::now() >= deadline {
-                self.countdown = None;
-                self.start_capture(ctx, video);
-            }
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if let Some(recorder) = &self.recorder {
-                recorder.stop();
-            }
-            self.countdown = None;
-        }
-        if !ctx.wants_keyboard_input() {
+        if !self.capture_ui.launcher && self.recorder.is_none() && !ctx.wants_keyboard_input() {
             if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
                 self.undo(ctx.input(|i| i.modifiers.shift));
             }
@@ -1794,11 +1658,21 @@ impl eframe::App for Editor {
                 self.delete_selected();
             }
         }
-        self.header(ctx);
-        self.footer(ctx);
-        self.capture_panel(ctx);
-        self.properties(ctx);
-        self.central(ctx);
+        if self.recorder.is_some() {
+            self.recording_dock(ctx);
+        } else if self.capture_ui.launcher || self.capture_ui.flow.active() {
+            self.capture_surface(ctx);
+        } else {
+            self.header(ctx);
+            self.footer(ctx);
+            self.properties(ctx);
+            self.central(ctx);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.capture_ui.flow.active() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.cancel_capture_flow(ctx);
+        }
+        self.admit_capture_timer(ctx);
         if ctx.input(|i| i.viewport().close_requested())
             && (self.recorder.is_some() || self.unsaved() || self.busy())
         {
@@ -1816,7 +1690,8 @@ impl eframe::App for Editor {
                 }
             });
         }
-        if self.busy() || self.unsaved() || self.recorder.is_some() || self.countdown.is_some() {
+        if self.busy() || self.unsaved() || self.recorder.is_some() || self.capture_ui.flow.active()
+        {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
     }
@@ -1996,9 +1871,15 @@ impl GuiSmoke {
     fn current_canvas(&self) -> Result<SmokeCanvas> {
         ensure!(
             self.editor.renderer_fixture
-                && self.editor.sources == Sources::default()
+                && self
+                    .editor
+                    .capture_ui
+                    .preferences
+                    .capture
+                    .effective_sources()
+                    == Sources::default()
                 && self.editor.recorder.is_none()
-                && self.editor.countdown.is_none(),
+                && !self.editor.capture_ui.flow.active(),
             "GUI-only proof must not activate capture sources."
         );
         ensure!(
@@ -2146,10 +2027,12 @@ pub fn gui_smoke_test(report: PathBuf) -> Result<()> {
     options.viewport = options
         .viewport
         .with_active(false)
-        .with_title("SteadyCapture renderer verification");
+        .with_title("Snapper renderer verification")
+        .with_inner_size([1440.0, 940.0])
+        .with_min_inner_size([1050.0, 720.0]);
     let started = Instant::now();
     let launch = eframe::run_native(
-        "SteadyCapture renderer verification",
+        "Snapper renderer verification",
         options,
         Box::new(move |cc| {
             let adapter = crate::graphics::adapter_report(

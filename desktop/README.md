@@ -1,4 +1,4 @@
-# SteadyCapture
+# Snapper Desktop
 
 A local Windows screenshot, screen-recording and image-annotation application.
 The desktop UI and device supervision are Rust. There is no browser server,
@@ -11,17 +11,25 @@ tested build before treating a feature or operating envelope as verified.
 
 ## Run
 
-Open `dist\SteadyCapture\SteadyCapture.exe` after packaging. Keep its `tools` and
+Open `snapper-desktop.exe` in the versioned local `dist\Snapper-0.2.0-<commit>` bundle after packaging. Keep its `tools` and
 `licenses` folders beside it. Windows 10 version 2004 or later, SDR display output,
 and a compatible Direct3D 12 adapter or Windows WARP software renderer are required. No administrator access is
 needed. This is an unsigned local development build; do not bypass an operating
 system security warning.
 
-All optional sources start **OFF**. Select a monitor/region, enable only the
-sources wanted, then click **Take screenshot** or **Record screen**. A visible
-three-second countdown precedes activation. Audio is never opened for a
-screenshot. Screen, webcam and audio devices run in a supervised subprocess;
-the editor can keep working while recording.
+New installations start with all optional sources **OFF**. Saved choices never
+open hardware at launch. Choose Screenshot or Recording in the compact launcher,
+select a region visually (or use Full monitor/Window guide), then review sources.
+Drag inside a selection to move it, use its handles to resize, and press Enter
+or Review sources to continue. **Escape cancels selection, review or countdown**,
+including an unfinished drag, without saving a capture or changing the clipboard.
+Window guide creates a fixed screen region, not isolated window-content capture.
+
+Preflight identifies the chosen camera, microphone and output route. Camera
+preview is a separate, explicit activation in a supervised process. Move/resize
+its picture-in-picture placement before capture. Only **Capture** or **Record**
+arms the configurable countdown. Screenshots never open audio sources.
+Recording uses a small movable control dock; the editor stays out of the way.
 
 The image editor includes editable arrows, text, callouts, rectangles, ellipses,
 lines, original built-in stamps, connected Fill, selection/global Color
@@ -46,7 +54,7 @@ machine PATH, execution policy, TLS settings, device permissions or priorities.
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 .\scripts\Package.ps1
-.\scripts\Verify.ps1
+.\scripts\Verify.ps1 -PackagePath <versioned-package>
 ```
 
 `--self-test` uses generated video, cursor and camera markers plus generated
@@ -77,5 +85,10 @@ report plus a PNG. It does not activate any screen, camera or audio capture.
 `--data-dir <absolute directory>` selects a separate local library.
 `--recover <session directory>` validates and exports an interrupted session.
 
-This repository is local-only. No remote or external publishing is configured.
-It contains no Snagit implementation, branding or proprietary assets.
+This desktop integration is local-only. The parent Snapper repository is public;
+no public push, release or upload is implied or authorized by these scripts.
+The existing Go `snapper.exe` remains a separate lightweight CLI with unchanged
+default capture/JSON behavior. Never run the root `build.ps1` as a desktop build:
+it replaces the installed CLI. See [import provenance](docs/IMPORT.md).
+
+This application contains no Snagit implementation, branding or proprietary assets.

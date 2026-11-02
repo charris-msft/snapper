@@ -1,5 +1,6 @@
 mod audio_timeline;
 pub mod encoder;
+pub mod preview;
 mod profile;
 mod publication;
 pub mod selftest;
@@ -43,6 +44,12 @@ pub struct Request {
     pub area: Area,
     pub sources: Sources,
     pub camera_id: Option<String>,
+    #[serde(default)]
+    pub microphone_id: Option<String>,
+    #[serde(default)]
+    pub output_id: Option<String>,
+    #[serde(default)]
+    pub pip: Option<crate::capture::PipLayout>,
     pub video: bool,
     pub max_seconds: u64,
     pub synthetic: bool,
@@ -57,6 +64,18 @@ impl Request {
             "Failure injection is restricted to generated-media tests."
         );
         crate::model::validate_size(self.area.width, self.area.height)?;
+        if let Some(pip) = self.pip {
+            pip.validate()?;
+        }
+        for id in [&self.camera_id, &self.microphone_id, &self.output_id]
+            .into_iter()
+            .flatten()
+        {
+            ensure!(
+                !id.is_empty() && id.len() <= 4096,
+                "Selected device identifier is invalid."
+            );
+        }
         ensure!(
             (1..=7200).contains(&self.max_seconds),
             "Recording duration must be 1-7200 seconds."
@@ -154,6 +173,10 @@ impl Progress {
 pub fn entry() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("--camera-preview") | Some("--generated-camera-preview") => {
+            preview::worker(args.get(1).context("Preview camera identifier is missing")?,
+                args[0] == "--generated-camera-preview")
+        },
         Some("--worker")=>{
             let path=args.get(1).context("Worker request path is missing")?;
             let request:Request=library::read_json(std::path::Path::new(path))?;

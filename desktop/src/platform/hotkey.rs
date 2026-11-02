@@ -1,3 +1,4 @@
+use crate::capture::{Shortcut, Shortcuts};
 use anyhow::{Context, Result};
 use std::{
     sync::{
@@ -12,7 +13,8 @@ use windows::Win32::{
     System::Threading::GetCurrentThreadId,
     UI::{
         Input::KeyboardAndMouse::{
-            RegisterHotKey, UnregisterHotKey, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, VK_F9,
+            RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL,
+            MOD_NOREPEAT, MOD_SHIFT, VK_ESCAPE, VK_F9,
         },
         WindowsAndMessaging::{GetMessageW, PostThreadMessageW, MSG, WM_HOTKEY, WM_QUIT},
     },
@@ -30,6 +32,40 @@ impl GlobalStop {
         Self::with_key(u32::from(VK_F9.0), repaint)
     }
     fn with_key(key: u32, repaint: impl Fn() + Send + 'static) -> Result<Self> {
+        Self::with_binding(
+            key,
+            MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
+            "Ctrl+Shift+function key",
+            repaint,
+        )
+    }
+    pub fn shortcut(shortcut: &Shortcut, repaint: impl Fn() + Send + 'static) -> Result<Self> {
+        let mut modifiers = MOD_NOREPEAT;
+        if shortcut.control {
+            modifiers |= MOD_CONTROL;
+        }
+        if shortcut.shift {
+            modifiers |= MOD_SHIFT;
+        }
+        if shortcut.alt {
+            modifiers |= MOD_ALT;
+        }
+        Self::with_binding(shortcut.key, modifiers, &shortcut.label(), repaint)
+    }
+    pub fn escape(repaint: impl Fn() + Send + 'static) -> Result<Self> {
+        Self::with_binding(
+            u32::from(VK_ESCAPE.0),
+            MOD_NOREPEAT,
+            "Escape (active selection only)",
+            repaint,
+        )
+    }
+    fn with_binding(
+        key: u32,
+        modifiers: HOT_KEY_MODIFIERS,
+        label: &str,
+        repaint: impl Fn() + Send + 'static,
+    ) -> Result<Self> {
         let flag = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let id = Arc::new(AtomicU32::new(0));
@@ -43,8 +79,7 @@ impl GlobalStop {
             // SAFETY: This thread owns the registration and its private message queue.
             unsafe {
                 thread_id.store(GetCurrentThreadId(), Ordering::Release);
-                if let Err(e) = RegisterHotKey(None, 1, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, key)
-                {
+                if let Err(e) = RegisterHotKey(None, 1, modifiers, key) {
                     let _ = ready.send(Err(e));
                     return;
                 }
@@ -82,8 +117,8 @@ impl GlobalStop {
             error,
             thread: Some(handle),
         };
-        rx.recv_timeout(Duration::from_secs(2)).context("Global Stop shortcut registration exceeded two seconds")?
-            .context("Ctrl+Shift+F9 is unavailable, possibly because another app owns it. The Stop button and focused Escape key still work")?;
+        rx.recv_timeout(Duration::from_secs(2)).context("Shortcut registration exceeded two seconds")?
+            .with_context(|| format!("{label} is already in use or unavailable. Snapper did not take it from another app; choose a different shortcut."))?;
         Ok(hotkey)
     }
     pub fn take_error(&self) -> Option<String> {
@@ -102,6 +137,12 @@ impl Drop for GlobalStop {
                 }
             }
         }
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while self.thread.as_ref().is_some_and(|t| !t.is_finished())
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
         if self.thread.as_ref().is_some_and(|t| t.is_finished()) {
             if let Some(t) = self.thread.take() {
                 if t.join().is_err() {
@@ -109,6 +150,31 @@ impl Drop for GlobalStop {
                 }
             }
         }
+    }
+}
+
+pub struct GlobalShortcuts {
+    pub capture: GlobalStop,
+    pub repeat: GlobalStop,
+    pub stop: GlobalStop,
+}
+
+impl GlobalShortcuts {
+    pub fn new(shortcuts: &Shortcuts, repaint: impl Fn() + Clone + Send + 'static) -> Result<Self> {
+        let [capture, repeat, stop] = shortcuts.parsed()?;
+        Ok(Self {
+            capture: GlobalStop::shortcut(&capture, repaint.clone())?,
+            repeat: GlobalStop::shortcut(&repeat, repaint.clone())?,
+            stop: GlobalStop::shortcut(&stop, repaint)?,
+        })
+    }
+
+    pub fn take_error(&self) -> Option<String> {
+        let errors: Vec<_> = [&self.capture, &self.repeat, &self.stop]
+            .into_iter()
+            .filter_map(GlobalStop::take_error)
+            .collect();
+        (!errors.is_empty()).then(|| errors.join("\n"))
     }
 }
 

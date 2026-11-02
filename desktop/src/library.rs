@@ -72,6 +72,16 @@ impl StagedFile {
         self.temporary = None;
         Ok(())
     }
+
+    pub fn publish_new(mut self) -> Result<()> {
+        let temporary = self
+            .temporary
+            .as_ref()
+            .context("Staged output is already published")?;
+        crate::platform::process::publish_new_file(temporary, &self.destination)?;
+        self.temporary = None;
+        Ok(())
+    }
 }
 
 impl Drop for StagedFile {
@@ -101,6 +111,17 @@ pub fn stage_bytes(path: &Path, bytes: &[u8]) -> Result<StagedFile> {
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     stage_bytes(path, bytes)?.publish()
+}
+
+pub fn copy_file_new(source: &Path, destination: &Path) -> Result<()> {
+    let mut input = File::open(source).context("Opening the saved library original")?;
+    let (staged, mut output) = StagedFile::create(destination)?;
+    std::io::copy(&mut input, &mut output)
+        .context("Copying the saved capture; the library original is retained")?;
+    output.flush()?;
+    output.sync_all()?;
+    drop(output);
+    staged.publish_new()
 }
 
 pub fn stage_json(path: &Path, value: &impl Serialize) -> Result<StagedFile> {
@@ -292,7 +313,7 @@ impl Library {
     pub fn default_root() -> Result<PathBuf> {
         Ok(
             PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?)
-                .join("SteadyCapture")
+                .join("Snapper")
                 .join("Library"),
         )
     }
@@ -439,6 +460,51 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_file_routing_is_atomic_and_never_overwrites_a_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("original.png");
+        let destination = directory.path().join("export.png");
+        fs::write(&source, b"immutable original").unwrap();
+        copy_file_new(&source, &destination).unwrap();
+        fs::write(&source, b"competing capture").unwrap();
+        assert!(copy_file_new(&source, &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"immutable original");
+        assert_eq!(fs::read(&source).unwrap(), b"competing capture");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn video_title_and_tags_persist_without_mutating_the_recording() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path().to_path_buf()).unwrap();
+        let mut capture = Capture {
+            schema: SCHEMA,
+            id: "video-fixture".into(),
+            title: "Recording".into(),
+            kind: CaptureKind::Video,
+            created_ms: 1,
+            width: 640,
+            height: 360,
+            tags: vec![],
+        };
+        let folder = library.capture_dir(&capture).unwrap();
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("recording.mp4"), b"encoded original fixture").unwrap();
+        library.save_capture(&capture).unwrap();
+        capture.title = "Demo".into();
+        capture.tags = vec!["work".into(), "bug".into()];
+        library.save_capture(&capture).unwrap();
+        let reopened: Capture = read_json(&folder.join("capture.json")).unwrap();
+        assert_eq!(
+            (reopened.title, reopened.tags),
+            (capture.title, capture.tags)
+        );
+        assert_eq!(
+            fs::read(folder.join("recording.mp4")).unwrap(),
+            b"encoded original fixture"
+        );
+    }
     #[test]
     fn image_document_and_style_persist() {
         let tmp = tempfile::tempdir().unwrap();

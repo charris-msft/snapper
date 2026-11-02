@@ -1,9 +1,75 @@
 use super::ComApartment;
 use anyhow::{ensure, Context, Result};
+use serde::{Deserialize, Serialize};
+use windows::core::{Interface, HSTRING};
 use windows::Win32::{
+    Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
     Media::Audio::*,
-    System::Com::{CoCreateInstance, CLSCTX_ALL},
+    System::Com::{
+        CoCreateInstance, CoTaskMemFree, StructuredStorage::PropVariantToString, CLSCTX_ALL,
+        STGM_READ,
+    },
 };
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub system: bool,
+    pub default: bool,
+}
+
+fn device_id(device: &IMMDevice) -> Result<String> {
+    // SAFETY: Copy the COM-allocated identifier before freeing its allocation exactly once.
+    unsafe {
+        let value = device.GetId()?;
+        let text = value.to_string();
+        CoTaskMemFree(Some(value.0.cast()));
+        Ok(text?)
+    }
+}
+
+pub fn list() -> Result<Vec<AudioDevice>> {
+    let _apartment = ComApartment::new()?;
+    // SAFETY: Read endpoint metadata on its COM thread. No IAudioClient is activated here.
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let mut devices = Vec::new();
+        for system in [true, false] {
+            let flow = if system { eRender } else { eCapture };
+            let default_id = match enumerator.GetDefaultAudioEndpoint(flow, eConsole) {
+                Ok(device) => Some(device_id(&device)?),
+                Err(error) if error.code().0 as u32 == 0x80070490 => None,
+                Err(error) => return Err(error).context("Reading the default audio route"),
+            };
+            let endpoints = enumerator.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE)?;
+            let count = endpoints.GetCount()?;
+            ensure!(
+                count <= 64,
+                "Audio enumeration exceeds its 64-device-per-direction budget."
+            );
+            for index in 0..count {
+                let device = endpoints.Item(index)?;
+                let id = device_id(&device)?;
+                let store = device.OpenPropertyStore(STGM_READ)?;
+                let value = store.GetValue(&PKEY_Device_FriendlyName)?;
+                let mut buffer = [0u16; 512];
+                PropVariantToString(&value, &mut buffer)
+                    .context("Reading an audio device's display name")?;
+                let length = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+                let name = String::from_utf16(&buffer[..length])?;
+                devices.push(AudioDevice {
+                    default: default_id.as_ref() == Some(&id),
+                    id,
+                    name,
+                    system,
+                });
+            }
+        }
+        Ok(devices)
+    }
+}
 
 pub struct Packet {
     pub timestamp: i64,
@@ -21,19 +87,27 @@ pub struct Audio {
 }
 impl Audio {
     pub fn open(system: bool) -> Result<Self> {
+        Self::open_selected(system, None)
+    }
+    pub fn open_selected(system: bool, selected: Option<&str>) -> Result<Self> {
         let apartment = ComApartment::new()?;
         // SAFETY: COM is initialized on this thread; all output pointers and format storage are live.
         // Only selected sources reach activation; enumeration never opens an endpoint.
         unsafe {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-            let device = enumerator
-                .GetDefaultAudioEndpoint(if system { eRender } else { eCapture }, eConsole)
-                .context(if system {
-                    "No default system-output audio device"
-                } else {
-                    "No default microphone or permission denied"
-                })?;
+            let flow = if system { eRender } else { eCapture };
+            let device = match selected {
+                Some(id) => enumerator.GetDevice(&HSTRING::from(id))
+                    .context("The selected audio device is unavailable. Choose a connected device; no substitute was activated.")?,
+                None => enumerator.GetDefaultAudioEndpoint(flow, eConsole)
+                    .context("No default audio device is available")?,
+            };
+            let endpoint: IMMEndpoint = device.cast()?;
+            ensure!(
+                endpoint.GetDataFlow()? == flow && device.GetState()? == DEVICE_STATE_ACTIVE,
+                "The selected device has the wrong audio direction or was disconnected."
+            );
             let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
             let format = WAVEFORMATEX {
                 wFormatTag: 1,
