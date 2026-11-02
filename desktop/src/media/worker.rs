@@ -1308,11 +1308,78 @@ mod tests {
     }
 
     #[test]
+    fn audio_queue_preserves_the_observed_converted_microphone_pair_in_client_time() {
+        use platform::audio::{Packet, PacketTiming};
+        let shared = audio_test_state();
+        let (tx, rx) = bounded(512);
+        let devices = Devices {
+            shared: shared.clone(),
+            threads: vec![],
+            screen: Arc::new(Mutex::new(None)),
+            camera: Arc::new(Mutex::new(None)),
+            audio: rx,
+        };
+        let mut timelines = vec![AudioTimeline::new(true, 0), AudioTimeline::new(false, 0)];
+        for (sequence, position, timestamp, marker) in [(1, 0, 0, 7), (2, 441, 100_000, 11)] {
+            send_audio(
+                &shared,
+                &tx,
+                AudioEvent::Packet {
+                    index: 1,
+                    observed: 1_000_000,
+                    packet: Packet {
+                        timing: PacketTiming {
+                            sequence,
+                            device_position: position,
+                            timestamp,
+                            frames: 480,
+                            flags: 0,
+                            client_rate_hz: 48_000,
+                            engine_mix_rate_hz: Some(44_100),
+                        },
+                        pcm: vec![marker; 1920],
+                    },
+                },
+            )
+            .unwrap();
+        }
+        receive_audio(&devices, &mut timelines, &shared).unwrap();
+        let mut written = Vec::new();
+        write_audio_until(
+            &mut timelines,
+            &PauseTimeline::default(),
+            960,
+            960,
+            false,
+            |index, ms, pcm| {
+                written.push((index, ms, pcm.to_vec()));
+                Ok(())
+            },
+            &shared,
+        )
+        .unwrap();
+        assert!(written == vec![(1, 0, vec![7; 1920]), (1, 10, vec![11; 1920])]);
+        assert_eq!(shared.audio_bytes.load(Ordering::Acquire), 0);
+        let progress = shared.progress.lock().unwrap();
+        assert_eq!(progress.peak_audio_queue_bytes, 3840);
+        assert_eq!(progress.audio_silence_frames, 0);
+        assert_eq!(progress.audio_discontinuities, 0);
+    }
+
+    #[test]
     fn deferred_audio_failures_keep_the_correct_queued_pair_and_selected_index() {
         use platform::audio::{Packet, PacketTiming};
         use windows::Win32::Media::Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY;
         for (case, first_frames, position, sample, discontinuity, expected) in [
             ("timestamp-gap", 480, 0, 28_800, true, "gap_frames=28320"),
+            (
+                "converted-gap",
+                480,
+                32_091,
+                24_481,
+                false,
+                "missing_frames=24001",
+            ),
             (
                 "device-gap",
                 480,
@@ -1342,7 +1409,11 @@ mod tests {
                     flags,
                     timestamp: (sample as i128 * 10_000_000 / i128::from(SAMPLE_RATE)) as i64,
                     client_rate_hz: SAMPLE_RATE as u32,
-                    engine_mix_rate_hz: Some(16_000),
+                    engine_mix_rate_hz: Some(if case == "converted-gap" {
+                        44_100
+                    } else {
+                        SAMPLE_RATE as u32
+                    }),
                 },
                 pcm: vec![sequence as u8; frames as usize * 4],
             };
@@ -1386,7 +1457,12 @@ mod tests {
                         0
                     },
                 ),
-                (current_sequence + 1, position + 480, sample + 480, 0),
+                (
+                    current_sequence + 1,
+                    position + if case == "converted-gap" { 441 } else { 480 },
+                    sample + 480,
+                    0,
+                ),
             ] {
                 let queued = packet(sequence, position, sample, 480, flags);
                 let observed = queued.timing.timestamp + 100_000;
@@ -1483,7 +1559,7 @@ mod tests {
             "index=1",
             "Microphone",
             "Unflagged",
-            "previous_end=10080",
+            "previous_position=9600",
             "flags=0x0",
             "engine_mix_rate_hz=Some(16000)",
         ] {

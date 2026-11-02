@@ -102,7 +102,26 @@ samples while waiting at the common start barrier.
 WASAPI's `DATA_DISCONTINUITY` flag ends correlation with the previous packet's
 device position, so it starts a new position-checking epoch without resetting
 the QPC/media timeline or replacing PCM. The next unflagged packet must again
-follow the prior packet's end. Invalid timestamps, backward QPC, oversized
+obey the applicable ordering checks. Without sample-rate conversion, device
+position and PCM-frame continuity use the stream's common frame domain.
+When `AUTOCONVERTPCM` converts between the client and engine rates, raw device
+positions are checked for monotonic order but never added to client-frame counts.
+Inter-packet duration and gaps use the paired `GetBuffer` QPC timestamps in
+100 ns units and the explicit client sample rate, with integer rational
+arithmetic. Neither `GetMixFormat` nor `IAudioClock::GetFrequency` is assumed to
+be the frequency of `GetBuffer`'s device-position counter. See Microsoft's
+[`GetBuffer`](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer)
+and [`AUTOCONVERTPCM`](https://learn.microsoft.com/en-us/windows/win32/coreaudio/audclnt-streamflags-xxx-constants)
+contracts.
+
+QPC positions are mapped to the nearest client sample. Contiguous PCM keeps its
+grid phase only when the packet interval agrees with nominal client duration
+within less than one QPC tick and the correction is at most one client sample.
+That narrow phase-carry condition is not a capture-rejection tolerance: modest
+native-clock variation still uses the existing active overlap/gap budgets after
+pause projection. The phase rule adds no arrival-clock substitution, unbounded
+drift correction, silence policy, or new fatal jitter threshold.
+Invalid timestamps, backward QPC, oversized
 packets and active-time gap/overlap budgets remain fail-closed. See Microsoft's
 [`AUDCLNT_BUFFERFLAGS` contract](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/ne-audioclient-_audclnt_bufferflags).
 Packet validation errors, both before queueing and during deferred timing

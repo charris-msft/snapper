@@ -98,7 +98,16 @@ impl PacketTiming {
         self.flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0
     }
 
-    pub fn end_position(self) -> Result<u64> {
+    pub fn rate_converted(self) -> bool {
+        self.engine_mix_rate_hz
+            .is_some_and(|rate| rate != self.client_rate_hz)
+    }
+
+    pub fn client_position_end(self) -> Result<u64> {
+        ensure!(
+            !self.rate_converted(),
+            "Converted PCM frame counts cannot be added to a device position."
+        );
         self.device_position
             .checked_add(u64::from(self.frames))
             .context("Audio device position overflow")
@@ -120,7 +129,9 @@ impl PacketTiming {
         ensure!(self.timestamp >= 0, "Audio QPC timestamp is invalid.");
         ensure!(self.flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0,
             "Audio source reported an invalid timestamp. Capture interrupted rather than guessing synchronization.");
-        self.end_position()?;
+        if !self.rate_converted() {
+            self.client_position_end()?;
+        }
         Ok(())
     }
 }
@@ -550,6 +561,7 @@ mod tests {
             },
             PacketTiming {
                 device_position: u64::MAX,
+                engine_mix_rate_hz: Some(PCM_SAMPLE_RATE),
                 ..valid
             },
             PacketTiming {
@@ -576,5 +588,27 @@ mod tests {
             assert!(description.contains(field), "{description}");
         }
         assert!(description.len() < 256);
+    }
+
+    #[test]
+    fn converted_headers_cannot_mix_client_frames_with_device_positions() {
+        let converted = timing();
+        converted.validate().unwrap();
+        assert!(converted
+            .client_position_end()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be added to a device position"));
+        PacketTiming {
+            device_position: u64::MAX,
+            ..converted
+        }
+        .validate()
+        .unwrap();
+        let unconverted = PacketTiming {
+            engine_mix_rate_hz: Some(PCM_SAMPLE_RATE),
+            ..converted
+        };
+        assert_eq!(unconverted.client_position_end().unwrap(), 480);
     }
 }

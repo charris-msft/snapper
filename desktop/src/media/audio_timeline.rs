@@ -3,6 +3,54 @@ use crate::platform::audio::{source_label, Packet, PacketTiming};
 use anyhow::{ensure, Context, Result};
 use std::collections::VecDeque;
 
+const QPC_UNITS_PER_SECOND: i128 = 10_000_000;
+
+fn client_interval_error(previous: PacketTiming, current: PacketTiming) -> i128 {
+    (i128::from(current.timestamp) - i128::from(previous.timestamp))
+        * i128::from(current.client_rate_hz)
+        - i128::from(previous.frames) * QPC_UNITS_PER_SECOND
+}
+
+fn packet_gap_frames(previous: PacketTiming, current: PacketTiming) -> Result<u64> {
+    ensure!(
+        current.client_rate_hz == previous.client_rate_hz
+            && current.engine_mix_rate_hz == previous.engine_mix_rate_hz,
+        "Audio packet formats changed within the selected stream."
+    );
+    if !current.rate_converted() {
+        let end = previous.client_position_end()?;
+        ensure!(
+            current.device_position >= end,
+            "Unflagged audio device position moved backwards or overlapped: position={} previous_end={end}.",
+            current.device_position
+        );
+        return Ok(current.device_position - end);
+    }
+
+    // AUTOCONVERTPCM changes the PCM frame domain, not a documented device-counter frequency.
+    // GetBuffer's paired QPC identifies the first sample in 100 ns units for either format.
+    ensure!(
+        current.device_position >= previous.device_position,
+        "Unflagged audio device position moved backwards: position={} previous_position={}.",
+        current.device_position,
+        previous.device_position
+    );
+    ensure!(
+        current.device_position != previous.device_position
+            || current.timestamp != previous.timestamp,
+        "Unflagged audio packet repeated its predecessor's device and QPC positions."
+    );
+    let delta = i128::from(current.timestamp) - i128::from(previous.timestamp);
+    ensure!(delta >= 0, "Audio timestamp moved backwards.");
+    let rate = i128::from(current.client_rate_hz);
+    let interval_error = client_interval_error(previous, current);
+    // Preserve a complete client-frame gap despite sub-tick quantization. Clock variation is
+    // not a fatal error here; the active gap/overlap budgets apply after pause projection.
+    let quantization = rate - 1;
+    u64::try_from((interval_error.max(0) + quantization) / QPC_UNITS_PER_SECOND)
+        .context("Converted audio packet gap overflow")
+}
+
 pub struct Prepared {
     pub sample: u64,
     pub pcm: Vec<u8>,
@@ -16,7 +64,7 @@ struct Pending {
     offset: usize,
     packet: Packet,
     previous_packet: Option<PacketTiming>,
-    device_gap: Option<(u64, u64)>,
+    packet_gap: Option<(u64, u64)>,
 }
 
 pub struct AudioTimeline {
@@ -26,7 +74,7 @@ pub struct AudioTimeline {
     drained: u64,
     last_delivery: i64,
     last_packet: Option<PacketTiming>,
-    previous_wall_end: u64,
+    previous_sample_end: i128,
     pending: VecDeque<Pending>,
     released: usize,
     revision: u64,
@@ -41,7 +89,7 @@ impl AudioTimeline {
             drained: 0,
             last_delivery: origin,
             last_packet: None,
-            previous_wall_end: 0,
+            previous_sample_end: 0,
             pending: VecDeque::new(),
             released: 0,
             revision: 0,
@@ -79,21 +127,38 @@ impl AudioTimeline {
         );
         // DATA_DISCONTINUITY explicitly ends correlation with the previous device position.
         // The QPC timeline and active gap/overlap checks remain independent of this boundary.
-        let device_gap = if timing.discontinuity() {
+        let packet_gap = if timing.discontinuity() {
             None
         } else if let Some(previous) = self.last_packet {
-            let end = previous.end_position()?;
-            ensure!(timing.device_position >= end,
-                "Unflagged audio device position moved backwards or overlapped: position={} previous_end={end}.",
-                timing.device_position);
-            Some((self.previous_wall_end, timing.device_position - end))
+            Some((
+                u64::try_from(self.previous_sample_end.max(0))
+                    .context("Audio endpoint sample overflow")?,
+                packet_gap_frames(previous, timing)?,
+            ))
         } else {
             None
         };
         let discontinuity = timing.discontinuity() && self.last_packet.is_some();
-        let start = (i128::from(timing.timestamp) - i128::from(self.origin))
-            * i128::from(SAMPLE_RATE)
-            / 10_000_000;
+        let scaled =
+            (i128::from(timing.timestamp) - i128::from(self.origin)) * i128::from(SAMPLE_RATE);
+        let half_sample = QPC_UNITS_PER_SECOND / 2;
+        let mut start = (scaled
+            + if scaled < 0 {
+                -half_sample
+            } else {
+                half_sample
+            })
+            / QPC_UNITS_PER_SECOND;
+        // Preserve the phase of contiguous PCM when quantized QPC stamps straddle a sample.
+        // Never smooth a real interval change or let this correction drift beyond one sample.
+        if !timing.discontinuity()
+            && self.last_packet.is_some_and(|previous| {
+                client_interval_error(previous, timing).abs() < i128::from(timing.client_rate_hz)
+            })
+            && (start - self.previous_sample_end).abs() <= 1
+        {
+            start = self.previous_sample_end;
+        }
         let trim = if start < 0 {
             (-start).min(i128::from(timing.frames)) as usize
         } else {
@@ -106,7 +171,7 @@ impl AudioTimeline {
         );
         self.last_packet = Some(timing);
         self.last_delivery = observed;
-        self.previous_wall_end = sample + u64::from(timing.frames) - trim as u64;
+        self.previous_sample_end = start + i128::from(timing.frames);
         if trim == timing.frames as usize {
             self.released += packet.pcm.len();
             return Ok(discontinuity);
@@ -116,7 +181,7 @@ impl AudioTimeline {
             offset: trim,
             packet,
             previous_packet,
-            device_gap,
+            packet_gap,
         });
         Ok(discontinuity)
     }
@@ -212,14 +277,14 @@ impl AudioTimeline {
                 self.consume((active.wall - start) as usize);
                 continue;
             }
-            if let Some((previous, missing)) = front.device_gap {
+            if let Some((previous, missing)) = front.packet_gap {
                 let paused = clock.paused_between(previous.min(start), start);
                 ensure!(
                     missing.saturating_sub(paused) <= 24_000,
-                    "{source}: audio device lost more than 500 ms of active samples. current=[{timing}] previous=[{}] missing_frames={missing} paused_frames={paused}.",
+                    "{source}: audio packet gap exceeds 500 ms of active client samples. current=[{timing}] previous=[{}] missing_frames={missing} paused_frames={paused}.",
                     predecessor()
                 );
-                self.pending.front_mut().unwrap().device_gap = None;
+                self.pending.front_mut().unwrap().packet_gap = None;
             }
             if active.media >= media_limit {
                 self.consume(available);
@@ -380,6 +445,262 @@ mod tests {
     }
 
     #[test]
+    fn converted_microphone_pair_preserves_pcm_and_pre_origin_drain() {
+        for origin in [0, 7_200_000] {
+            let mut timeline = AudioTimeline::new(false, origin);
+            let clock = PauseTimeline::default();
+            let mut output = Vec::new();
+            for (sequence, position, sample, marker) in [(1, 0, 0, 7), (2, 441, 480, 11)] {
+                let mut next = packet(position, sample, 480, marker);
+                next.timing.sequence = sequence;
+                next.timing.engine_mix_rate_hz = Some(44_100);
+                timeline.observe(next, origin + 1_000_000).unwrap();
+                output.extend(drain(&mut timeline, &clock, 960));
+            }
+            let expected = if origin == 0 {
+                vec![(0, vec![7; 1920]), (480, vec![11; 1920])]
+            } else {
+                vec![]
+            };
+            assert_eq!(output, expected);
+            assert_eq!(timeline.take_released_bytes(), 3840);
+        }
+    }
+
+    #[test]
+    fn rate_converted_fractional_packets_preserve_every_client_frame() {
+        for counter_rate in [
+            8000, 11_025, 16_000, 22_050, 44_100, 48_000, 96_000, 192_000,
+        ] {
+            for system in [false, true] {
+                let mut timeline = AudioTimeline::new(system, 0);
+                let clock = PauseTimeline::default();
+                let mut sample = 0;
+                let mut expected_bytes = Vec::new();
+                let mut actual_bytes = Vec::new();
+                for (index, frames) in [1, 1, 127, 479, 480, 481, 997, 1].into_iter().enumerate() {
+                    let mut next = packet(
+                        sample * counter_rate / SAMPLE_RATE,
+                        sample,
+                        frames,
+                        index as u8 + 1,
+                    );
+                    next.timing.sequence = index as u64 + 1;
+                    next.timing.engine_mix_rate_hz = Some(counter_rate as u32);
+                    let observed = next.timing.timestamp + 200_000;
+                    expected_bytes.extend_from_slice(&next.pcm);
+                    timeline.observe(next, observed).unwrap();
+                    sample += u64::from(frames);
+                    for (_, bytes) in drain(&mut timeline, &clock, sample) {
+                        actual_bytes.extend(bytes);
+                    }
+                }
+                assert_eq!(
+                    actual_bytes.len(),
+                    expected_bytes.len(),
+                    "counter_rate={counter_rate} system={system}: client PCM byte count"
+                );
+                assert!(
+                    actual_bytes == expected_bytes,
+                    "counter_rate={counter_rate} system={system}: generated PCM markers changed"
+                );
+                assert_eq!(timeline.take_released_bytes(), expected_bytes.len());
+            }
+        }
+    }
+
+    #[test]
+    fn modest_native_qpc_variation_preserves_pcm_without_a_new_fatal_limit() {
+        for engine_rate in [16_000, 44_100, 48_000, 96_000] {
+            for second_stamp in [99_990, 100_010] {
+                let mut timeline = AudioTimeline::new(false, 0);
+                let mut output = Vec::new();
+                for (sequence, stamp, position, marker) in [
+                    (1, 0, 0, 7),
+                    (2, second_stamp, u64::from(engine_rate) / 100, 11),
+                    (3, 200_000, u64::from(engine_rate) / 50, 13),
+                ] {
+                    let mut next = packet(position, 0, 480, marker);
+                    next.timing.sequence = sequence;
+                    next.timing.timestamp = stamp;
+                    next.timing.engine_mix_rate_hz = Some(engine_rate);
+                    timeline.observe(next, stamp + 100_000).unwrap();
+                    output.extend(drain(
+                        &mut timeline,
+                        &PauseTimeline::default(),
+                        sequence * 480,
+                    ));
+                }
+                assert!(output == vec![(0, vec![7; 1920]), (480, vec![11; 1920]), (960, vec![13; 1920])],
+                    "engine_rate={engine_rate} stamp={second_stamp}: modest QPC variation changed PCM");
+                assert_eq!(timeline.take_released_bytes(), 5760);
+            }
+        }
+    }
+
+    #[test]
+    fn converted_gap_uses_client_duration_without_assuming_counter_frequency_or_exact_qpc() {
+        for engine_rate in [16_000, 44_100, 96_000] {
+            for counter_step in [1, 160, 441, 480, 960] {
+                for frames in [1, 127, 479, 480, 481] {
+                    let mut previous = packet(1000, 0, frames, 1).timing;
+                    previous.engine_mix_rate_hz = Some(engine_rate);
+                    let minimum_delta =
+                        i64::from(frames) * 10_000_000 / i64::from(previous.client_rate_hz);
+                    let mut current = previous;
+                    current.sequence = 2;
+                    current.device_position += counter_step;
+                    current.timestamp = minimum_delta;
+                    assert_eq!(packet_gap_frames(previous, current).unwrap(), 0);
+                    current.timestamp = minimum_delta - 1;
+                    assert_eq!(packet_gap_frames(previous, current).unwrap(), 0,
+                        "Sub-sample clock variation is handled by the existing active timeline, not a new fatal tick limit.");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn converted_raw_regression_and_format_changes_remain_errors() {
+        for engine_rate in [16_000, 44_100, 96_000] {
+            let mut previous = packet(9600, 0, 480, 1).timing;
+            previous.engine_mix_rate_hz = Some(engine_rate);
+            let mut current = previous;
+            current.sequence = 2;
+            current.timestamp = 100_000;
+            current.device_position = 9599;
+            let error = packet_gap_frames(previous, current)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("position moved backwards"), "{error}");
+            current.device_position = previous.device_position;
+            current.timestamp = previous.timestamp;
+            assert!(packet_gap_frames(previous, current)
+                .unwrap_err()
+                .to_string()
+                .contains("repeated its predecessor"));
+            current.device_position = 10_080;
+            current.timestamp = 100_000;
+            current.engine_mix_rate_hz = Some(32_000);
+            assert!(packet_gap_frames(previous, current)
+                .unwrap_err()
+                .to_string()
+                .contains("formats changed"));
+        }
+    }
+
+    #[test]
+    fn converted_time_gaps_are_in_client_samples_at_the_active_limit() {
+        for engine_rate in [16_000, 44_100, 96_000] {
+            for gap in [0, 1, 24_000, 24_001] {
+                let mut timeline = AudioTimeline::new(false, 0);
+                let mut first = packet(9600, 0, 127, 1);
+                first.timing.engine_mix_rate_hz = Some(engine_rate);
+                timeline.observe(first, 100_000).unwrap();
+                drain(&mut timeline, &PauseTimeline::default(), 127);
+                let sample = 127 + gap;
+                let mut next = packet(
+                    9600 + sample * u64::from(engine_rate) / SAMPLE_RATE,
+                    sample,
+                    480,
+                    2,
+                );
+                next.timing.sequence = 2;
+                next.timing.engine_mix_rate_hz = Some(engine_rate);
+                let observed = next.timing.timestamp + 100_000;
+                timeline.observe(next, observed).unwrap();
+                assert_eq!(timeline.pending.front().unwrap().packet_gap.unwrap().1, gap);
+                let result =
+                    timeline.prepare_next(&PauseTimeline::default(), sample + 480, u64::MAX, false);
+                if gap > 24_000 {
+                    let error = match result {
+                        Err(error) => format!("{error:#}"),
+                        Ok(_) => panic!("The converted active gap limit was bypassed."),
+                    };
+                    assert!(error.contains("missing_frames=24001"), "{error}");
+                    assert!(
+                        error.contains("previous=[sequence=1 position=9600"),
+                        "{error}"
+                    );
+                } else {
+                    assert!(result.is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unflagged_converted_packets_keep_the_existing_active_overlap_budget() {
+        for engine_rate in [16_000, 44_100, 96_000] {
+            for overlap in [960, 961] {
+                let mut timeline = AudioTimeline::new(false, 0);
+                let mut first = packet(9600, 0, 1920, 1);
+                first.timing.engine_mix_rate_hz = Some(engine_rate);
+                timeline.observe(first, 400_000).unwrap();
+                drain(&mut timeline, &PauseTimeline::default(), 1920);
+                let mut next = packet(10_000, 1920 - overlap, 1440, 2);
+                next.timing.engine_mix_rate_hz = Some(engine_rate);
+                next.timing.sequence = 2;
+                timeline.observe(next, 600_000).unwrap();
+                let result =
+                    timeline.prepare_next(&PauseTimeline::default(), 3360, u64::MAX, false);
+                if overlap == 960 {
+                    let prepared = result.unwrap().unwrap();
+                    assert_eq!(prepared.sample, 1920);
+                    assert_eq!(prepared.pcm.len(), (1440 - 960) * 4);
+                } else {
+                    let error = match result {
+                        Err(error) => format!("{error:#}"),
+                        Ok(_) => panic!("The existing active overlap budget was bypassed."),
+                    };
+                    assert!(error.contains("overlap_frames=961"), "{error}");
+                    assert!(
+                        error.contains("previous=[sequence=1 position=9600"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_qpc_phase_carry_is_bounded_and_does_not_bridge_real_gaps() {
+        for phase_ticks in [0, 1, 104, 105, 207, 208] {
+            let base = 1_000_000;
+            let mut timeline = AudioTimeline::new(false, base - phase_ticks);
+            let mut bytes = Vec::new();
+            for index in 0..1000u64 {
+                let sample = index * 127;
+                let mut next = packet(sample * 44_100 / SAMPLE_RATE, sample, 127, 9);
+                next.timing.engine_mix_rate_hz = Some(44_100);
+                next.timing.timestamp += base;
+                let observed = next.timing.timestamp + 100_000;
+                timeline.observe(next, observed).unwrap();
+                for (_, pcm) in drain(&mut timeline, &PauseTimeline::default(), sample + 256) {
+                    bytes.extend(pcm);
+                }
+                let qpc_sample = (timeline.last_packet.unwrap().timestamp - timeline.origin)
+                    as i128
+                    * i128::from(SAMPLE_RATE)
+                    / QPC_UNITS_PER_SECOND;
+                assert!((timeline.previous_sample_end - 127 - qpc_sample).abs() <= 1);
+            }
+            assert_eq!(bytes.len(), 1000 * 127 * 4);
+        }
+        let mut timeline = AudioTimeline::new(false, 0);
+        for (position, sample) in [(0, 0), (441, 481)] {
+            let mut next = packet(position, sample, 480, 7);
+            next.timing.engine_mix_rate_hz = Some(44_100);
+            timeline.observe(next, 200_000).unwrap();
+        }
+        assert_eq!(
+            timeline.pending[1].sample, 481,
+            "A real one-sample interval gap must not be phase-carried away."
+        );
+        assert_eq!(timeline.pending[1].packet_gap.unwrap().1, 1);
+    }
+
+    #[test]
     fn declared_discontinuity_starts_new_position_correlation_without_replacing_pcm() {
         for system in [false, true] {
             let mut timeline = AudioTimeline::new(system, 0);
@@ -426,8 +747,7 @@ mod tests {
                     timeline.observe(next, 200_000).unwrap();
                 }
                 let expected_end = if reset { 480 } else { 10_080 };
-                let mut overlap = packet(expected_end - 1, 960, 480, 3);
-                overlap.timing.engine_mix_rate_hz = Some(16_000);
+                let overlap = packet(expected_end - 1, 960, 480, 3);
                 let error = timeline.observe(overlap, 300_000).unwrap_err();
                 let description = format!("{error:#}");
                 for field in [
@@ -441,7 +761,7 @@ mod tests {
                     "qpc_100ns=200000",
                     "flags=0x0",
                     "client_rate_hz=48000",
-                    "engine_mix_rate_hz=Some(16000)",
+                    "engine_mix_rate_hz=None",
                     "observed_qpc_100ns=300000",
                 ] {
                     assert!(description.contains(field), "{description}");
@@ -569,33 +889,37 @@ mod tests {
     #[test]
     fn declared_reset_inside_pause_retains_only_active_pcm_and_the_frozen_stop_tail() {
         for system in [false, true] {
-            let mut clock = PauseTimeline::default();
-            clock.set_paused(480, true).unwrap();
-            clock.set_paused(1440, false).unwrap();
-            clock.freeze(1679);
-            let mut timeline = AudioTimeline::new(system, 0);
-            for (position, sample, marker, discontinuity) in [
-                (9600, 0, 1, false),
-                (0, 480, 2, true),
-                (480, 960, 3, false),
-                (960, 1440, 4, false),
-            ] {
-                let mut next = packet(position, sample, 480, marker);
-                if discontinuity {
-                    next.timing.flags = AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32;
+            for rate in [16_000, 44_100, 48_000, 96_000] {
+                let mut clock = PauseTimeline::default();
+                clock.set_paused(480, true).unwrap();
+                clock.set_paused(1440, false).unwrap();
+                clock.freeze(1679);
+                let mut timeline = AudioTimeline::new(system, 0);
+                for (position, sample, marker, discontinuity) in [
+                    (9600, 0, 1, false),
+                    (0, 480, 2, true),
+                    (480, 960, 3, false),
+                    (960, 1440, 4, false),
+                ] {
+                    let mut next = packet(position * rate / SAMPLE_RATE, sample, 480, marker);
+                    next.timing.engine_mix_rate_hz = Some(rate as u32);
+                    if discontinuity {
+                        next.timing.flags = AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32;
+                    }
+                    timeline.observe(next, 400_000).unwrap();
                 }
-                timeline.observe(next, 400_000).unwrap();
+                let mut output = Vec::new();
+                while let Some(prepared) =
+                    timeline.prepare_next(&clock, 1679, u64::MAX, true).unwrap()
+                {
+                    assert_eq!(prepared.silence_frames, 0);
+                    output.push((prepared.sample, prepared.pcm.clone()));
+                    timeline.commit(&prepared).unwrap();
+                }
+                assert_eq!(output, vec![(0, vec![1; 1920]), (480, vec![4; 239 * 4])]);
+                assert_eq!(timeline.committed, 719);
+                assert_eq!(timeline.take_released_bytes(), 4 * 1920);
             }
-            let mut output = Vec::new();
-            while let Some(prepared) = timeline.prepare_next(&clock, 1679, u64::MAX, true).unwrap()
-            {
-                assert_eq!(prepared.silence_frames, 0);
-                output.push((prepared.sample, prepared.pcm.clone()));
-                timeline.commit(&prepared).unwrap();
-            }
-            assert_eq!(output, vec![(0, vec![1; 1920]), (480, vec![4; 239 * 4])]);
-            assert_eq!(timeline.committed, 719);
-            assert_eq!(timeline.take_released_bytes(), 4 * 1920);
         }
     }
 
